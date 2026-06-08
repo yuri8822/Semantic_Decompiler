@@ -1,0 +1,6 @@
+anthropic
+openai
+networkx
+pydantic
+rich
+sqlite-utils
