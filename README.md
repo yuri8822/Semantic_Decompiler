@@ -78,7 +78,7 @@ ANTHROPIC_MODEL_FAST  = "claude-sonnet-4-6"
 XIAOMI_MODEL = "mimo-v2.5-pro"
 
 # Ollama (local)
-OLLAMA_MODEL = "qwen2.5-coder:7b"
+OLLAMA_MODEL = "carstenuhlig/omnicoder-9b:q4_k_m"
 ```
 
 ---
