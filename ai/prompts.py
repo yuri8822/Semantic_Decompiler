@@ -92,11 +92,16 @@ def build_user_prompt(pass_num: int, function_data: dict, code: str,
                       callee_summaries: list = None,
                       caller_summaries: list = None,
                       recovered_types: str = "",
-                      api_context: str = "") -> str:
+                      api_context: str = "",
+                      ai_name: str = "") -> str:
     parts = []
 
     parts.append(f"FUNCTION: {function_data['name']}")
     parts.append(f"SIGNATURE: {function_data.get('signature', '')}")
+
+    # Pass 2 locked in a semantic name — all later passes must preserve it exactly
+    if ai_name and pass_num >= 3:
+        parts.append(f"\nLOCKED FUNCTION NAME: `{ai_name}` — this name was chosen in a previous pass. You MUST use this exact name for the function definition. Do not revert to the original Ghidra name.")
 
     if function_data.get("strings"):
         parts.append("\nREFERENCED STRINGS:")

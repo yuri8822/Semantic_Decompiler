@@ -77,7 +77,10 @@ class LLMClient:
             system=system,
             messages=[{"role": "user", "content": user}],
         )
-        return msg.content[0].text
+        for block in msg.content:
+            if getattr(block, "type", None) == "text":
+                return block.text
+        return ""
 
     def _xiaomi_complete(self, system: str, user: str) -> str:
         msg = self._client.messages.create(
@@ -86,7 +89,10 @@ class LLMClient:
             system=system,
             messages=[{"role": "user", "content": user}],
         )
-        return msg.content[0].text
+        for block in msg.content:
+            if getattr(block, "type", None) == "text":
+                return block.text
+        return ""
 
     def _ollama_complete(self, system: str, user: str) -> str:
         resp = self._client.chat.completions.create(

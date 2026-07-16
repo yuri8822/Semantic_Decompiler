@@ -25,6 +25,67 @@ def _strip_fences(text: str) -> str:
     return text.strip()
 
 
+_NAME_SKIP = frozenset({
+    "if", "else", "while", "for", "switch", "do", "return",
+    "struct", "class", "enum", "typedef", "extern", "static", "inline",
+})
+
+
+def extract_function_name(code: str, fallback: str) -> str:
+    """
+    Extract the function name the AI chose in its output.
+    Looks for the first function definition line (has parens, followed by {).
+    Tracks multi-line /* ... */ comments so a parenthesized word inside a
+    doc comment can't be mistaken for the function's own name.
+    """
+    in_comment = False
+    lines = code.split("\n")
+    for i, line in enumerate(lines):
+        s = line.strip()
+        if in_comment:
+            if "*/" in s:
+                in_comment = False
+            continue
+        if s.startswith("/*"):
+            if "*/" not in s:
+                in_comment = True
+            continue
+        if not s or s.startswith("//") or s.startswith("#"):
+            continue
+        if re.match(r'^(struct|class|enum|typedef|extern)\b', s):
+            continue
+        if "(" not in s:
+            continue
+        # Must be a definition: has { on this line or the very next
+        has_brace = "{" in s or (
+            i + 1 < len(lines) and lines[i + 1].strip().startswith("{")
+        )
+        if not has_brace:
+            continue
+        # Skip forward declarations (ends with ; but no {)
+        sig = s.split("{")[0].rstrip()
+        if sig.endswith(";"):
+            continue
+        before_paren = sig.split("(")[0].rstrip()
+        m = re.search(r'\b([A-Za-z_]\w*)\s*$', before_paren)
+        if m and m.group(1) not in _NAME_SKIP:
+            return m.group(1)
+    return fallback
+
+
+def _dropped_callees(before: str, after: str, callees: list[str]) -> set[str]:
+    """
+    Return callees that were present in `before` but are absent in `after`.
+    Only checks names that actually appeared in `before` — so if a callee was
+    already renamed in a prior pass it won't appear in `before` and won't fire.
+    """
+    return {
+        name for name in callees
+        if re.search(r'\b' + re.escape(name) + r'\b', before)
+        and not re.search(r'\b' + re.escape(name) + r'\b', after)
+    }
+
+
 class MultiPassTranslator:
     def __init__(self, db: SemanticDB, num_passes: int = NUM_PASSES,
                  provider: str = LLM_PROVIDER, ollama_model: str = OLLAMA_MODEL):
@@ -51,8 +112,13 @@ class MultiPassTranslator:
         recovered_types = self.db.get_types_for_context()
         callee_summaries = self.db.get_callee_summaries(address)
         caller_summaries = self.db.get_caller_summaries(name)
+        callees = function_data.get("callees", [])
+
+        ai_name = ""  # locked in after pass 2
 
         for pass_num in range(1, self.num_passes + 1):
+            prev_code = current_code
+
             system = SYSTEMS[pass_num]
             user = build_user_prompt(
                 pass_num=pass_num,
@@ -64,10 +130,27 @@ class MultiPassTranslator:
                 caller_summaries=caller_summaries,
                 recovered_types=recovered_types,
                 api_context=api_context,
+                ai_name=ai_name,
             )
 
-            current_code = _call_llm(self._llm, system, user, pass_num)
+            new_code = _call_llm(self._llm, system, user, pass_num)
+
+            # Fix 1 — callee guard: revert if any known callee was silently dropped.
+            # Only applied from pass 3 onwards (pass 2 legitimately renames calls).
+            if pass_num >= 3 and callees:
+                dropped = _dropped_callees(prev_code, new_code, callees)
+                if dropped:
+                    new_code = prev_code  # reject this pass, keep previous output
+
+            current_code = new_code
             self.db.set_pass_output(address, pass_num, current_code)
+
+            # Fix 2 — name lock: after pass 2 (renaming), capture the AI's chosen
+            # function name and store it so later passes can't silently revert it.
+            if pass_num == 2:
+                ai_name = extract_function_name(current_code, fallback="")
+                if ai_name and ai_name != name:
+                    self.db.set_ai_name(address, ai_name)
 
             # After pass 3, extract any new type definitions and store them
             if pass_num == 3:
@@ -77,7 +160,8 @@ class MultiPassTranslator:
         self.db.set_final_cpp(address, current_code)
 
         # Generate a one-line summary for the call-graph context of other functions
-        summary = self._summarise(name, current_code)
+        display_name = ai_name or name
+        summary = self._summarise(display_name, current_code)
         self.db.set_summary(address, summary)
 
         return current_code

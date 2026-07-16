@@ -33,12 +33,14 @@ class SemanticDB:
                 name            TEXT    NOT NULL,
                 address         TEXT    NOT NULL UNIQUE,
                 signature       TEXT    DEFAULT '',
+                ai_name         TEXT    DEFAULT '',  -- name chosen by AI in pass 2 (locked in)
                 summary         TEXT    DEFAULT '',  -- one-line AI-generated description
                 pass1_output    TEXT    DEFAULT '',
                 pass2_output    TEXT    DEFAULT '',
                 pass3_output    TEXT    DEFAULT '',
                 pass4_output    TEXT    DEFAULT '',
                 pass5_output    TEXT    DEFAULT '',
+                pass6_output    TEXT    DEFAULT '',
                 final_cpp       TEXT    DEFAULT '',
                 analyzed_at     TEXT    DEFAULT (datetime('now'))
             );
@@ -101,6 +103,14 @@ class SemanticDB:
             conn.execute("""
                 UPDATE functions SET final_cpp = ? WHERE address = ?
             """, (cpp, address))
+
+    def set_ai_name(self, address: str, name: str):
+        with self._conn() as conn:
+            conn.execute("UPDATE functions SET ai_name = ? WHERE address = ?", (name, address))
+
+    def get_ai_name(self, address: str) -> str:
+        fn = self.get_function(address)
+        return (fn.get("ai_name") or "") if fn else ""
 
     def set_summary(self, address: str, summary: str):
         with self._conn() as conn:

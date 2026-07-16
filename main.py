@@ -42,57 +42,10 @@ from analyzer.ir_builder import build_ir
 from analyzer.cfg_builder import build_cfg_summary
 from analyzer.types_db import SemanticDB
 from analyzer.known_apis import KNOWN_APIS
-from ai.translator import MultiPassTranslator
+from ai.translator import MultiPassTranslator, extract_function_name
 from output.writer import ProjectWriter
 
 console = Console()
-
-
-_NAME_SKIP = frozenset({
-    "if", "else", "while", "for", "switch", "do", "return",
-    "struct", "class", "enum", "typedef", "extern", "static", "inline",
-})
-
-
-def _extract_ai_name(cpp: str, fallback: str) -> str:
-    """
-    Extract only the function name from AI-generated code.
-    Much simpler than extracting the full signature: just find the identifier
-    immediately before '(' on the first function definition line.
-    """
-    in_comment = False
-    lines = cpp.split("\n")
-    for i, line in enumerate(lines):
-        s = line.strip()
-        if in_comment:
-            if "*/" in s:
-                in_comment = False
-            continue
-        if s.startswith("/*"):
-            if "*/" not in s:
-                in_comment = True
-            continue
-        if not s or s.startswith("//") or s.startswith("#"):
-            continue
-        if re.match(r'^(struct|class|enum|typedef|extern)\b', s):
-            continue
-        if "(" not in s:
-            continue
-        # Must be a definition: has { on this line or the very next
-        has_brace = "{" in s or (
-            i + 1 < len(lines) and lines[i + 1].strip().startswith("{")
-        )
-        if not has_brace:
-            continue
-        # Skip forward declarations (ends with ; but no {)
-        sig = s.split("{")[0].rstrip()
-        if sig.endswith(";"):
-            continue
-        before_paren = sig.split("(")[0].rstrip()
-        m = re.search(r'\b([A-Za-z_]\w*)\s*$', before_paren)
-        if m and m.group(1) not in _NAME_SKIP:
-            return m.group(1)
-    return fallback
 
 
 def _check_env(provider: str):
@@ -258,7 +211,7 @@ def main():
                 api_context=api_context,
             )
 
-            ai_name = _extract_ai_name(cpp, fn.name)
+            ai_name = extract_function_name(cpp, fn.name)
             writer.add_function(ai_name, fn.address, cpp, fn.signature)
             progress.advance(task)
 
