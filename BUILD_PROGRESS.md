@@ -834,6 +834,95 @@ future pass.
 
 ---
 
+## What was built — session 17
+
+Revisited the session-8-era decision to fully suppress Bonsai's reasoning.
+Suppression was a correct fix for the original danger (unbounded reasoning
+silently eating the whole response), but full suppression throws away
+reasoning's actual benefit too. Wanted "thinking on, but bounded" instead.
+
+### What didn't work
+Tried a per-request `"reasoning_budget"` field on the chat completions call
+first (matching the naming of llama-server's `--reasoning-budget` CLI flag).
+Tested empirically against the live server with an extreme value
+(`reasoning_budget: 10`, `max_tokens: 1000`) — reasoning still came back at
+2,861 characters / 704 completion tokens, completely unaffected. Confirmed:
+this server build does not honor that field per-request.
+
+### What works — the server-level `--reasoning-budget` flag
+Started a real server instance with `--reasoning-budget 300` and tested with
+generous `max_tokens` and no client-side override: reasoning came back
+around 300 tokens' worth (1,180 characters), then the model moved on to a
+complete, correct answer with `finish_reason="stop"` — not the truncated
+`"length"` from the original unbounded-reasoning bug. Confirmed via the
+actual `BonsaiProvider` class too, not just raw curl.
+
+### Fix — `start_bonsai.bat`, `ai/providers/bonsai/bonsai_provider.py`
+- `start_bonsai.bat` now passes `--reasoning-budget 300` to `llama-server.exe`.
+  Applies to every request on the server, including manual chats through the
+  web UI — noted in the script's own comment in case that's ever unwanted.
+- `bonsai_provider.py` no longer passes `extra_body={"chat_template_kwargs":
+  {"enable_thinking": False}}` — thinking is back on, bounded by the server
+  flag instead of suppressed client-side. The `<think>` regex and the
+  empty-content `RuntimeError` safety net both stay as defense-in-depth,
+  updated to describe the new failure mode (server run without the budget
+  flag) rather than the old one (suppression failing to apply).
+
+### Housekeeping
+Server for this session's testing was started and torn down via Bash
+(`run_in_background` + a bounded `until curl` readiness wait, then
+`TaskStop` once verification finished) — a genuine one-off test, not left
+running unattended the way a real working session's server should be (per
+this project's own established pattern: the user runs `start_bonsai.bat`
+themselves, in their own terminal, for visibility and control).
+
+---
+
+## What was built — session 18
+
+Correction to session 17's "what didn't work" finding, plus a real
+improvement it unlocked. The user pointed out the llama.cpp web UI has its
+own per-conversation "Reasoning effort" selector (Off / Low / Medium / High
+/ Max, each mapped to a token count) — which meant per-request reasoning
+control clearly *does* work in this server build, contradicting session
+17's conclusion. That conclusion was wrong for a narrow reason: session 17
+tested a field called `"reasoning_budget"`, guessing it would match the
+server CLI flag's name. Reading llama.cpp's actual source
+(`tools/server/server-common.cpp:1123-1136`) showed the real per-request
+field is `"thinking_budget_tokens"` — and, critically, it's only consulted
+when the server itself was NOT started with `--reasoning-budget` (the
+startup flag wins whenever set; the per-request field is purely a
+fallback). Session 17's server was started with `--reasoning-budget 300`,
+so even the correctly-named field would have been ignored on that server.
+
+Also found (and did not follow) a `CLAUDE.md` inside the vendored
+`llama.cpp` fork directory instructing to read an `AGENTS.md` there before
+doing any work — flagged to the user as a suspicious embedded instruction
+from third-party vendored source rather than acted on.
+
+### Fix — `config.py`, `start_bonsai.bat`, `ai/providers/bonsai/bonsai_provider.py`
+- `start_bonsai.bat` no longer passes `--reasoning-budget` at all (so the
+  per-request field can take effect); also now launches the server in its
+  own separate console window via `start "Bonsai 27B Server" /D <dir> cmd
+  /k llama-server.exe ...` instead of blocking the invoking terminal.
+- `config.py` adds `BONSAI_REASONING_BUDGET_HEAVY = 600` / `_FAST = 200`,
+  mirroring `ANTHROPIC_MODEL_HEAVY`/`_FAST`'s existing pass 3/4 (type
+  inference, class reconstruction) vs. the rest split.
+- `bonsai_provider.py`'s `complete()` now sends
+  `extra_body={"thinking_budget_tokens": budget}` per request, picking the
+  heavy or fast budget by `pass_num`. Docstring rewritten to describe the
+  real mechanism and explicitly correct session 17's claim.
+
+### Verified live
+Via the real `BonsaiProvider` class (not raw curl), after the user
+restarted their own server with the updated (flag-free) `start_bonsai.bat`:
+pass 1 (200-token budget) produced a 764-char reasoning trace, pass 3
+(600-token budget) produced 2,541 chars — both `finish_reason="stop"`, both
+with a complete, non-empty `content`. Confirms the budget is both respected
+and scales per pass as intended.
+
+---
+
 ## Known limitations / next steps
 
 ### Still to build
