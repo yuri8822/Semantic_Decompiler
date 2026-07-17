@@ -19,6 +19,7 @@ import argparse
 import os
 import re
 import sys
+import time
 from pathlib import Path
 
 try:
@@ -38,7 +39,10 @@ from rich.progress import (
     TimeElapsedColumn,
 )
 
-from config import DB_PATH, GHIDRA_JSON_DIR, NUM_PASSES, OUTPUT_DIR, LLM_PROVIDER, OLLAMA_MODEL
+from config import (
+    DB_PATH, GHIDRA_JSON_DIR, NUM_PASSES, OUTPUT_DIR, LLM_PROVIDER, OLLAMA_MODEL,
+    OUTPUT_WRITE_EVERY_N_FUNCTIONS, OUTPUT_WRITE_EVERY_SECONDS,
+)
 from analyzer.ghidra_runner import analyze_binary
 from analyzer.parse_output import load_analysis
 from analyzer.ir_builder import build_ir
@@ -133,7 +137,18 @@ def main():
     json_path = _resolve_json_path(binary_path)
     export_exists = Path(json_path).exists()
 
-    if args.force_ghidra or (not args.skip_ghidra and not export_exists):
+    # Staleness check: if the binary itself is newer than its export (e.g.
+    # it was recompiled since), auto-reuse would otherwise silently analyze
+    # stale data with zero indication anything changed. Only meaningful when
+    # the binary is actually on disk to compare against — reusing an export
+    # without the original binary present (a normal --skip-ghidra workflow)
+    # has nothing to compare, so it's left alone.
+    export_stale = (
+        export_exists and binary_path.exists()
+        and binary_path.stat().st_mtime > Path(json_path).stat().st_mtime
+    )
+
+    if args.force_ghidra or (not args.skip_ghidra and (not export_exists or export_stale)):
         console.print("\n[bold][1/4][/bold] Running Ghidra headless analysis...")
         try:
             json_path = analyze_binary(str(binary_path), verbose=args.verbose)
@@ -149,6 +164,12 @@ def main():
         # analysis is the slowest, most re-runnable-for-no-reason step in
         # the pipeline. --skip-ghidra remains valid for explicitness; a
         # missing export still errors out the same way it always has.
+        if export_stale:
+            console.print(
+                f"[bold yellow]Warning:[/bold yellow] {binary_path.name} looks newer than its "
+                f"Ghidra export (skipping anyway since --skip-ghidra was explicit). "
+                f"Pass --force-ghidra for a fresh analysis if you've recompiled it."
+            )
         reason = "requested via --skip-ghidra" if args.skip_ghidra else "existing export found"
         console.print(f"\n[bold][1/4][/bold] [dim]Skipping Ghidra ({reason}) — using {json_path}[/dim]")
         if not Path(json_path).exists():
@@ -203,6 +224,25 @@ def main():
     )
     writer = ProjectWriter(output_dir=args.output, binary_name=binary_path.stem)
 
+    # Throttle writer.write() instead of calling it after every function —
+    # it fully re-serializes everything accumulated so far, so calling it
+    # unconditionally is O(n^2) over a large run. Writes at most every
+    # OUTPUT_WRITE_EVERY_N_FUNCTIONS functions or OUTPUT_WRITE_EVERY_SECONDS
+    # seconds, whichever comes first; the unconditional final write after
+    # the loop always catches whatever this misses.
+    since_last_write = 0
+    last_write_time = time.monotonic()
+
+    def _write_if_due():
+        nonlocal since_last_write, last_write_time
+        since_last_write += 1
+        due = (since_last_write >= OUTPUT_WRITE_EVERY_N_FUNCTIONS
+               or time.monotonic() - last_write_time >= OUTPUT_WRITE_EVERY_SECONDS)
+        if due:
+            writer.write()
+            since_last_write = 0
+            last_write_time = time.monotonic()
+
     with Progress(
         SpinnerColumn(),
         TextColumn("[progress.description]{task.description:<40}"),
@@ -224,7 +264,7 @@ def main():
                 cached = db.get_function(fn.address)
                 ai_name = cached.get("ai_name") or fn.name
                 writer.add_function(ai_name, fn.address, cached["final_cpp"], fn.signature)
-                writer.write()  # keep output on disk current in case of interruption
+                _write_if_due()
                 progress.advance(task)
                 continue
 
@@ -243,7 +283,7 @@ def main():
 
             ai_name = extract_function_name(cpp, fn.name)
             writer.add_function(ai_name, fn.address, cpp, fn.signature)
-            writer.write()  # keep output on disk current in case of interruption
+            _write_if_due()
             progress.advance(task)
 
     # ----------------------------------------------------------------

@@ -45,15 +45,18 @@ class SemanticDB:
     # Schema
     # ------------------------------------------------------------------
 
-    def init(self):
-        columns_sql = ",\n                ".join(
-            f"{col:<15} {ddl}" for col, ddl in self._FUNCTIONS_COLUMNS.items()
+    @classmethod
+    def _functions_columns_sql(cls, indent: str = "                ") -> str:
+        return (",\n" + indent).join(
+            f"{col:<15} {ddl}" for col, ddl in cls._FUNCTIONS_COLUMNS.items()
         )
+
+    def init(self):
         with self._conn() as conn:
             conn.executescript(f"""
             CREATE TABLE IF NOT EXISTS functions (
                 id              INTEGER PRIMARY KEY,
-                {columns_sql}
+                {self._functions_columns_sql()}
             );
 
             CREATE TABLE IF NOT EXISTS recovered_types (
@@ -96,15 +99,55 @@ class SemanticDB:
         databases; a database created before a schema change would otherwise
         crash on the first read/write of the new column (this has already
         happened once, with `pass6_output`).
+
+        Tries the cheap path first (`ALTER TABLE ADD COLUMN`), which covers
+        ordinary additive columns. SQLite refuses that for anything with a
+        PRIMARY KEY/UNIQUE/CHECK constraint, a NOT NULL without a constant
+        default, or a non-constant DEFAULT (e.g. `datetime('now')`) — for
+        those, falls back to a full table rebuild.
         """
         existing = {row["name"] for row in conn.execute("PRAGMA table_info(functions)")}
-        for col, ddl in self._FUNCTIONS_COLUMNS.items():
-            if col in existing:
-                continue
+        missing = [col for col in self._FUNCTIONS_COLUMNS if col not in existing]
+        if not missing:
+            return
+
+        needs_rebuild = []
+        for col in missing:
             try:
-                conn.execute(f"ALTER TABLE functions ADD COLUMN {col} {ddl}")
+                conn.execute(f"ALTER TABLE functions ADD COLUMN {col} {self._FUNCTIONS_COLUMNS[col]}")
             except sqlite3.OperationalError:
-                pass  # e.g. a non-constant DEFAULT, which ADD COLUMN can't take
+                needs_rebuild.append(col)
+
+        if needs_rebuild:
+            print(f"[types_db] Rebuilding functions table to add: {', '.join(needs_rebuild)} "
+                  f"(ALTER TABLE ADD COLUMN can't add these — likely a NOT NULL, "
+                  f"UNIQUE, or non-constant DEFAULT column)")
+            self._rebuild_functions_table(conn)
+
+    def _rebuild_functions_table(self, conn):
+        """
+        Recreate `functions` with the current `_FUNCTIONS_COLUMNS` schema and
+        copy over every column that already exists (columns brand-new to
+        this rebuild get their schema default, same as a fresh row would).
+        SQLite DDL is transactional, so this rolls back cleanly with the rest
+        of `init()`'s `_conn()` block if anything here fails.
+        """
+        existing_cols = [row["name"] for row in conn.execute("PRAGMA table_info(functions)")]
+        carried_over = [col for col in self._FUNCTIONS_COLUMNS if col in existing_cols]
+        col_list = ", ".join(carried_over)
+
+        conn.execute(f"""
+            CREATE TABLE functions_rebuild (
+                id              INTEGER PRIMARY KEY,
+                {self._functions_columns_sql(indent="                ")}
+            )
+        """)
+        conn.execute(f"""
+            INSERT INTO functions_rebuild (id, {col_list})
+            SELECT id, {col_list} FROM functions
+        """)
+        conn.execute("DROP TABLE functions")
+        conn.execute("ALTER TABLE functions_rebuild RENAME TO functions")
 
     # ------------------------------------------------------------------
     # Functions table
@@ -144,6 +187,25 @@ class SemanticDB:
     def set_provider(self, address: str, provider: str):
         with self._conn() as conn:
             conn.execute("UPDATE functions SET provider = ? WHERE address = ?", (provider, address))
+
+    def clear_pass_data(self, address: str):
+        """
+        Wipe all pass outputs, final_cpp, ai_name, and summary for a
+        function. Used when switching providers, so stale results from a
+        different provider can never be left dangling under the new
+        provider's marker — otherwise an interruption right after the
+        switch (before the new provider has produced anything) would let
+        old, unmigrated data masquerade as "complete" under the new
+        provider on a later resumed run.
+        """
+        with self._conn() as conn:
+            conn.execute("""
+                UPDATE functions SET
+                    pass1_output = '', pass2_output = '', pass3_output = '',
+                    pass4_output = '', pass5_output = '', pass6_output = '',
+                    final_cpp = '', ai_name = '', summary = ''
+                WHERE address = ?
+            """, (address,))
 
     def is_complete_for_provider(self, address: str, provider: str) -> bool:
         """

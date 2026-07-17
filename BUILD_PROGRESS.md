@@ -455,6 +455,100 @@ Provider-aware resume, step 2 of 4 (see session 7 and
 
 ---
 
+## What was built — session 11
+
+Static code review of all 4 provider-aware-resume steps (sessions 7-10),
+no commands run — read-only audit first, fix applied after. Found one real
+correctness bug and several smaller items (see edge cases below for the
+ones left open).
+
+### The bug: provider-switch + early interruption could mislabel stale data as done
+`ai/translator.py`'s `translate()` used to call `self.db.set_provider(address,
+self.provider)` immediately after determining `same_provider`, before any
+actual work under the new provider had happened. Traced a concrete failure:
+a function fully completed by `anthropic`, then rerun with `--provider
+bonsai` — if interrupted in the first few seconds (before bonsai's pass 1
+even finishes), the DB would end up with `provider='bonsai'` while
+`final_cpp` still held the complete, untouched `anthropic` result.
+`is_complete_for_provider` checks only "`final_cpp` non-empty AND `provider`
+matches" — both true — so a later run would silently skip this function as
+"already done via bonsai," when it's 100% stale anthropic output mislabeled,
+with no error or warning.
+
+### Fix — `analyzer/types_db.py` / `ai/translator.py`
+- Added `SemanticDB.clear_pass_data(address)`: wipes `pass1_output` …
+  `pass6_output`, `final_cpp`, `ai_name`, and `summary` for a function.
+- `translate()` now calls `self.db.clear_pass_data(address)` *before*
+  `set_provider()`, whenever `same_provider` is `False`. This closes the
+  dangerous window regardless of exactly where an interruption lands: if it
+  hits between the clear and the provider write, `final_cpp` is already
+  empty (safe); if it hits right after, same thing. The same-provider resume
+  path (session 9) is unaffected — `clear_pass_data` is only called when
+  switching providers or seeing a function for the first time, never when
+  `same_provider` is `True`, so Step 3's mid-function resume still works off
+  the untouched stored passes.
+
+### Other findings from the review — all now resolved (see below)
+- ~~`ai_name` isn't re-persisted to the DB during a pass-level resume~~ —
+  **fixed.** The resume-scan in `translate()` now calls `self.db.set_ai_name(
+  address, ai_name)` when re-deriving `ai_name` from a stored `pass2_output`,
+  mirroring the main loop's pass-2 handling exactly (only persists if a
+  rename actually happened, and it's a harmless idempotent overwrite if it
+  was already persisted correctly the first time).
+- ~~The schema migration can't add columns needing `NOT NULL`/`UNIQUE`
+  without a default~~ — **fixed properly.** `_migrate_functions_columns`
+  tries the cheap `ALTER TABLE ADD COLUMN` path first for every missing
+  column; anything that fails (a constrained or non-constant-default column)
+  now falls back to `_rebuild_functions_table`: create a new table matching
+  the current schema, copy over every column that already exists (a
+  genuinely new column takes its schema default via SQL's normal
+  omitted-column behavior), drop the old table, rename the new one into
+  place. SQLite DDL is transactional, so this rolls back cleanly with the
+  rest of `init()`'s connection block if anything fails partway.
+  Verified against a synthetic old-style DB (missing both `provider` and the
+  non-constant-default `analyzed_at`, in a scratch copy, not the real
+  database): the existing row survived with zero data loss, `provider`
+  came in via the cheap ALTER path, and `analyzed_at` correctly triggered
+  the rebuild and got a real timestamp. Confirmed no regression by also
+  running `init()` against the real, in-use `semantic.db` — a clean no-op
+  since it already has every column.
+- ~~Ghidra export auto-reuse has no staleness check against the actual
+  binary file~~ — **fixed.** `main.py` now compares the binary's mtime
+  against its export's mtime (only when the binary is actually present on
+  disk to compare — a `--skip-ghidra` workflow with just the export and no
+  original binary around has nothing to compare, and is left alone). If the
+  binary is newer than its export: with no explicit flags, Ghidra now
+  re-runs automatically instead of silently reusing stale data; with
+  `--skip-ghidra` passed explicitly, the stale export is still reused (an
+  explicit request wins) but now prints a `Warning:` pointing at
+  `--force-ghidra`. Verified the full decision table (force/skip/exists/stale
+  × 7 representative combinations) matches intent, and the staleness
+  comparison itself against real controlled file mtimes (export newer, binary
+  newer, binary missing entirely).
+- ~~`writer.write()` per function is O(n) per call~~ — **mitigated (not
+  eliminated).** Rather than the fuller fix (rewriting `ProjectWriter` to
+  append function blocks and cache type-extraction incrementally instead of
+  re-serializing everything each call), went with the cheaper option: throttle
+  how often `main.py` actually calls `writer.write()`. New
+  `OUTPUT_WRITE_EVERY_N_FUNCTIONS` (5) / `OUTPUT_WRITE_EVERY_SECONDS` (30) in
+  `config.py` — a `_write_if_due()` closure in `main()` calls `writer.write()`
+  only when one of those thresholds is crossed, whichever comes first. The
+  unconditional final `writer.write()` after the loop is untouched, so
+  complete output is still always guaranteed at the end regardless of where
+  the throttle last fired. This cuts the O(n²) rewrite cost by roughly a
+  factor of `OUTPUT_WRITE_EVERY_N_FUNCTIONS`, at the cost of a real (if
+  small) regression in the crash-safety story from session 8: an
+  interruption can now lose up to 4 functions' worth of progress (or up to
+  30 seconds) instead of at most 1. Verified the throttle logic directly
+  (count-based trigger at every 5th call, time-based trigger firing
+  immediately on a simulated 31-second gap even with count still at 1), and
+  confirmed live against the real pipeline that deleting the output files
+  and rerunning `--limit 3` (3 cached functions, all under both thresholds —
+  no mid-loop write ever fires) still produces complete, correct output via
+  the final unconditional write.
+
+---
+
 ## Known limitations / next steps
 
 ### Still to build

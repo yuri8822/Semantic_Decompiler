@@ -49,6 +49,15 @@ OLLAMA_MAX_TOKENS = 4096  # local models typically cap at 4k
 AI_TIMEOUT_SECONDS = 120
 DECOMPILER_TIMEOUT_SECONDS = 60
 
+# --- Output ---
+# ProjectWriter.write() fully re-serializes every accumulated function each
+# call, so calling it after literally every function is O(n^2) over a large
+# run. Throttle it instead: write at most every N functions, or every S
+# seconds, whichever comes first. The final write after the loop finishes is
+# always unconditional, so nothing is ever missing from disk at the end.
+OUTPUT_WRITE_EVERY_N_FUNCTIONS = 5
+OUTPUT_WRITE_EVERY_SECONDS = 30
+
 # --- Pipeline ---
 NUM_PASSES = 6
 PASS_NAMES = [

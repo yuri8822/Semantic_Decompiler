@@ -135,6 +135,16 @@ class MultiPassTranslator:
         existing = self.db.get_function(address)
         same_provider = bool(existing) and existing.get("provider") == self.provider
 
+        # Switching providers (or a brand-new function): any stale results
+        # from a different provider must be cleared BEFORE marking the new
+        # provider. Otherwise, an interruption right after the switch (before
+        # this provider has produced anything) could leave `provider` set to
+        # the new one while `final_cpp` still holds the old provider's
+        # complete result — which is_complete_for_provider would then wrongly
+        # read as "already done" on a later resumed run.
+        if not same_provider:
+            self.db.clear_pass_data(address)
+
         # Mark which provider is (re)producing this function's results, so a
         # resumed run can tell "already done" from "done by someone else"
         self.db.set_provider(address, self.provider)
@@ -151,6 +161,8 @@ class MultiPassTranslator:
                 start_pass = pass_num + 1
                 if pass_num == 2:
                     ai_name = extract_function_name(current_code, fallback="")
+                    if ai_name and ai_name != name:
+                        self.db.set_ai_name(address, ai_name)  # idempotent if already persisted
                 if pass_num == 3:
                     self._harvest_types(current_code, address)  # idempotent
             if start_pass > 1:
