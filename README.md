@@ -103,7 +103,8 @@ python main.py <binary> [options]
 | `--passes` | `6` | Number of AI passes (1–6) |
 | `--limit` | `0` (all) | Process only the first N functions |
 | `--output` | `output/recovered` | Output directory |
-| `--skip-ghidra` | — | Reuse existing Ghidra JSON export |
+| `--skip-ghidra` | — | Reuse existing Ghidra JSON export (now automatic if one exists — kept for explicitness) |
+| `--force-ghidra` | — | Re-run Ghidra even if an export already exists |
 | `--verbose` | — | Stream Ghidra output to stdout |
 
 **Examples:**

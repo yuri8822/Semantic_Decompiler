@@ -6,6 +6,9 @@ Usage:
     python main.py <binary> [options]
 
     --skip-ghidra   Use an existing data/ghidra_json/<binary>.json export
+                    (an existing export is now reused automatically anyway —
+                    this remains for explicitness / backwards compatibility)
+    --force-ghidra  Re-run Ghidra even if an export already exists
     --passes N      Number of AI refinement passes (1-6, default 6)
     --output DIR    Output directory (default: output/recovered)
     --limit N       Process only the first N functions (0 = all)
@@ -76,7 +79,13 @@ def main():
     parser.add_argument("binary", help="Path to the binary to analyze")
     parser.add_argument(
         "--skip-ghidra", action="store_true",
-        help="Skip Ghidra analysis (use existing JSON export)"
+        help="Skip Ghidra analysis (use existing JSON export). An existing "
+             "export is now reused automatically regardless of this flag; "
+             "it remains for explicitness / backwards compatibility"
+    )
+    parser.add_argument(
+        "--force-ghidra", action="store_true",
+        help="Re-run Ghidra even if an export for this binary already exists"
     )
     parser.add_argument(
         "--passes", type=int, default=NUM_PASSES,
@@ -121,7 +130,10 @@ def main():
     # ----------------------------------------------------------------
     # Step 1: Ghidra analysis
     # ----------------------------------------------------------------
-    if not args.skip_ghidra:
+    json_path = _resolve_json_path(binary_path)
+    export_exists = Path(json_path).exists()
+
+    if args.force_ghidra or (not args.skip_ghidra and not export_exists):
         console.print("\n[bold][1/4][/bold] Running Ghidra headless analysis...")
         try:
             json_path = analyze_binary(str(binary_path), verbose=args.verbose)
@@ -133,8 +145,12 @@ def main():
             sys.exit(1)
         console.print(f"  [green]✓[/green] Export written to {json_path}")
     else:
-        json_path = _resolve_json_path(binary_path)
-        console.print(f"\n[bold][1/4][/bold] [dim]Skipping Ghidra — using {json_path}[/dim]")
+        # Resume support: reuse an existing export automatically — Ghidra
+        # analysis is the slowest, most re-runnable-for-no-reason step in
+        # the pipeline. --skip-ghidra remains valid for explicitness; a
+        # missing export still errors out the same way it always has.
+        reason = "requested via --skip-ghidra" if args.skip_ghidra else "existing export found"
+        console.print(f"\n[bold][1/4][/bold] [dim]Skipping Ghidra ({reason}) — using {json_path}[/dim]")
         if not Path(json_path).exists():
             console.print(f"[bold red]Error:[/bold red] JSON not found at {json_path}")
             sys.exit(1)
@@ -208,6 +224,7 @@ def main():
                 cached = db.get_function(fn.address)
                 ai_name = cached.get("ai_name") or fn.name
                 writer.add_function(ai_name, fn.address, cached["final_cpp"], fn.signature)
+                writer.write()  # keep output on disk current in case of interruption
                 progress.advance(task)
                 continue
 
@@ -226,6 +243,7 @@ def main():
 
             ai_name = extract_function_name(cpp, fn.name)
             writer.add_function(ai_name, fn.address, cpp, fn.signature)
+            writer.write()  # keep output on disk current in case of interruption
             progress.advance(task)
 
     # ----------------------------------------------------------------

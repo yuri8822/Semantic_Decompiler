@@ -326,15 +326,132 @@ already finished cleanly.
   configured in this environment — but the actual skip-decision function is
   the same one exercised above, just with a different provider string.)
 
-### Remaining steps (not yet built, per the approved plan)
-2. Incremental output writing — `writer.write()` currently only runs once,
-   after the *entire* function loop finishes, so a crash before that point
-   still loses all output files even though the DB has complete data.
-3. Pass-level resume within a function — currently a function that gets
-   reprocessed always restarts at pass 1, even if passes 1-3 already
-   completed under the same provider.
-4. Auto-detect Ghidra export reuse — `--skip-ghidra` still has to be passed
-   manually; nothing yet checks whether an export already exists by default.
+### Remaining steps (per the approved plan)
+~~2. Incremental output writing~~ — done, see session 8 below.
+~~3. Pass-level resume within a function~~ — done, see session 9 below.
+~~4. Auto-detect Ghidra export reuse~~ — done, see session 10 below.
+
+All four steps of the provider-aware resume plan (`nifty-popping-steele.md`)
+are now complete.
+
+---
+
+## What was built — session 10
+
+Provider-aware resume, step 4 of 4 (final step — see sessions 7-9):
+auto-detect Ghidra export reuse.
+
+### `main.py`
+- Added `--force-ghidra` (re-run Ghidra even if an export already exists).
+- The Ghidra step now resolves `json_path` and checks for an existing export
+  *before* deciding whether to run analysis, rather than only checking it
+  inside the `--skip-ghidra` branch. Decision logic: run fresh if
+  `--force-ghidra` was passed, or if neither `--skip-ghidra` nor an existing
+  export apply; otherwise reuse whatever export exists. `--skip-ghidra`
+  keeps working exactly as before (explicit, and still errors out the same
+  way if no export exists) — it's just no longer the *only* way to skip
+  Ghidra, since an existing export is now reused automatically by default.
+
+### Verified with real Ghidra runs, not mocked
+- Ran against the real `C:\Windows\System32\find.exe` (needed the actual
+  binary on disk, not just its JSON export, since `--force-ghidra` has to
+  invoke real analysis) with **no** `--skip-ghidra` flag: console showed
+  `Skipping Ghidra (existing export found)`, completed in 2.1s total
+  (Ghidra reuse + an already-cached function) — confirmed auto-detection
+  works without needing the manual flag.
+- Ran the same command with `--force-ghidra`: console showed `Running
+  Ghidra headless analysis...` and took ~36s (a real headless Ghidra
+  invocation, JVM startup included) — confirmed via the export file's
+  modification time updating to match the run, proving a genuine fresh
+  write happened rather than a silent no-op.
+
+---
+
+## What was built — session 9
+
+Provider-aware resume, step 3 of 4 (see sessions 7-8 and
+`nifty-popping-steele.md`): pass-level resume within a function.
+
+### `ai/translator.py`
+- `MultiPassTranslator.translate()` now checks, before running any passes,
+  whether `db.get_function(address)`'s stored `provider` matches
+  `self.provider`. If so, it scans `pass1_output` … up to `self.num_passes`
+  for the longest *contiguous* run of already-stored passes (stopping at the
+  first gap) and resumes right after it — reusing that stored code as
+  `current_code` instead of restarting at pass 1. A stored pass belonging to
+  a *different* provider is never reused; the scan only runs when the
+  provider matches, exactly mirroring the session-7 skip logic's safety
+  rule.
+- Restores in-loop state correctly when skipping ahead: re-extracts `ai_name`
+  from a stored `pass2_output` via the existing `extract_function_name()`
+  (not just the persisted `ai_name` DB column, which only captures the "did
+  a rename actually happen" case and would miss "extraction succeeded but
+  the name didn't change"), and re-runs `_harvest_types()` against a stored
+  `pass3_output` (idempotent — safe even if it already ran before an
+  interruption).
+- Logs `[translator] Resuming <name> from pass N (passes 1-N-1 already done
+  by <provider>)` when a resume actually happens, for visibility.
+
+### Verified against a real simulated interruption, not synthetic data
+- Took a fully-completed function (`find.exe`'s `FUN_140001140`, 6/6 passes
+  done under `bonsai`) and manually cleared `pass4_output`, `pass5_output`,
+  `pass6_output`, `final_cpp`, and `summary` directly in `semantic.db` —
+  simulating a crash immediately after pass 3 finished.
+- First rerun attempt (server was temporarily down) still proved the
+  critical thing: the log showed `Resuming FUN_140001140 from pass 4
+  (passes 1-3 already done by bonsai)` before failing on an unrelated
+  connection error — confirming the resume-point detection fired correctly
+  even though the actual LLM call couldn't complete. The DB was left
+  untouched by the failed attempt (pass 4-6 still empty), proving no
+  corruption from a failed resume attempt either.
+- Once the server was back up, reran the identical command: completed in
+  1m21s total for 2 cached functions + 1 resumed one. Confirmed via the DB
+  that passes 1-3 came back byte-identical in length to the values
+  preserved before the simulated interruption (proving genuine reuse, not
+  silent recomputation), passes 4-6 completed fresh, `final_cpp` was set,
+  and a coherent summary was generated from the finished result.
+- Read the actual final code, not just its presence/length: legitimate,
+  well-structured CRT startup/dispatch logic survived the resume intact
+  (guard-callback locking, static initializer finalizers, `_amsg_exit`/
+  `_initterm`/`_cexit` calls). One real Bonsai output bug spotted in passing
+  — `static_cast UINT (uReturnCode);` is missing its angle brackets
+  (`static_cast<UINT>(...)`), invalid C++ — unrelated to the resume
+  mechanism itself; no current guard checks basic syntax validity, same
+  category as the `return 0;`-in-a-void-function issue found earlier.
+
+---
+
+## What was built — session 8
+
+Provider-aware resume, step 2 of 4 (see session 7 and
+`nifty-popping-steele.md`): incremental output writing.
+
+### `main.py`
+- `writer.write()` now runs after every single function (both the cache-hit
+  branch and the freshly-processed branch), instead of only once after the
+  entire loop finishes. `ProjectWriter.write()` was already safe to call
+  repeatedly — it fully regenerates all three output files from its
+  in-memory `self._functions` list each time, so this is just cheap extra
+  disk I/O for small text files, not a design change to `output/writer.py`.
+
+### Verified live, not just by inspection after the fact
+- Ran `python main.py find.exe --provider bonsai --skip-ghidra --limit 3`
+  in the background (mixes one cached function with two that need real
+  translation). While the process was still actively working on the third
+  function, checked `output/recovered/find/recovered.cpp` and
+  `function_index.txt` on disk directly — both already reflected the two
+  completed functions (`InitializeApplication`, `ParseCommandLineAndCopyOffset`),
+  confirmed by their banner comments and index rows appearing mid-run,
+  before the process had finished or been interrupted at all. This is the
+  actual scenario the feature targets: a crash or Ctrl+C at any point now
+  leaves real, current, reviewable output on disk rather than nothing.
+- Also incidentally re-confirmed session 7's caching end to end: the first
+  function reused its session-7 cached result (`provider='bonsai'` match),
+  and its `ai_name` — `InitializeApplication` — differed from the name a
+  much earlier test run had produced for the same function, a reminder that
+  Bonsai's local, non-deterministic inference can pick a different name
+  each time it's asked to actually translate a function (not a caching bug;
+  confirmed by checking the DB directly against what was on disk).
 
 ---
 

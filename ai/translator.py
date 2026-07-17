@@ -128,9 +128,34 @@ class MultiPassTranslator:
         if not current_code.strip():
             return f"// {name}: decompiler produced no output\nvoid {name}() {{}}\n"
 
+        # Pass-level resume: a prior attempt by this SAME provider may have
+        # completed some passes before being interrupted. A stored pass
+        # belonging to a DIFFERENT (or no) provider must never be reused —
+        # only compare before overwriting the provider marker below.
+        existing = self.db.get_function(address)
+        same_provider = bool(existing) and existing.get("provider") == self.provider
+
         # Mark which provider is (re)producing this function's results, so a
         # resumed run can tell "already done" from "done by someone else"
         self.db.set_provider(address, self.provider)
+
+        ai_name = ""  # locked in after pass 2
+        start_pass = 1
+
+        if same_provider:
+            for pass_num in range(1, self.num_passes + 1):
+                stored = existing.get(f"pass{pass_num}_output") or ""
+                if not stored:
+                    break
+                current_code = stored
+                start_pass = pass_num + 1
+                if pass_num == 2:
+                    ai_name = extract_function_name(current_code, fallback="")
+                if pass_num == 3:
+                    self._harvest_types(current_code, address)  # idempotent
+            if start_pass > 1:
+                print(f"[translator] Resuming {name} from pass {start_pass} "
+                      f"(passes 1-{start_pass - 1} already done by {self.provider})")
 
         # Fetch shared context (types discovered so far, neighbour summaries)
         recovered_types = self.db.get_types_for_context()
@@ -138,9 +163,7 @@ class MultiPassTranslator:
         caller_summaries = self.db.get_caller_summaries(name)
         callees = function_data.get("callees", [])
 
-        ai_name = ""  # locked in after pass 2
-
-        for pass_num in range(1, self.num_passes + 1):
+        for pass_num in range(start_pass, self.num_passes + 1):
             prev_code = current_code
 
             system = SYSTEMS[pass_num]
