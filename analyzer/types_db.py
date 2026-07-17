@@ -18,6 +18,26 @@ from typing import Optional
 
 
 class SemanticDB:
+    # Additive columns on `functions` — the single source of truth for both
+    # CREATE TABLE (new databases) and the migration below (existing ones).
+    # `id` is intentionally excluded; it's the primary key, defined separately.
+    _FUNCTIONS_COLUMNS = {
+        "name":         "TEXT    NOT NULL",
+        "address":      "TEXT    NOT NULL UNIQUE",
+        "signature":    "TEXT    DEFAULT ''",
+        "ai_name":      "TEXT    DEFAULT ''",  # name chosen by AI in pass 2 (locked in)
+        "provider":     "TEXT    DEFAULT ''",  # which LLM provider produced the current results
+        "summary":      "TEXT    DEFAULT ''",  # one-line AI-generated description
+        "pass1_output": "TEXT    DEFAULT ''",
+        "pass2_output": "TEXT    DEFAULT ''",
+        "pass3_output": "TEXT    DEFAULT ''",
+        "pass4_output": "TEXT    DEFAULT ''",
+        "pass5_output": "TEXT    DEFAULT ''",
+        "pass6_output": "TEXT    DEFAULT ''",
+        "final_cpp":    "TEXT    DEFAULT ''",
+        "analyzed_at":  "TEXT    DEFAULT (datetime('now'))",
+    }
+
     def __init__(self, db_path: str):
         self.db_path = db_path
 
@@ -26,23 +46,14 @@ class SemanticDB:
     # ------------------------------------------------------------------
 
     def init(self):
+        columns_sql = ",\n                ".join(
+            f"{col:<15} {ddl}" for col, ddl in self._FUNCTIONS_COLUMNS.items()
+        )
         with self._conn() as conn:
-            conn.executescript("""
+            conn.executescript(f"""
             CREATE TABLE IF NOT EXISTS functions (
                 id              INTEGER PRIMARY KEY,
-                name            TEXT    NOT NULL,
-                address         TEXT    NOT NULL UNIQUE,
-                signature       TEXT    DEFAULT '',
-                ai_name         TEXT    DEFAULT '',  -- name chosen by AI in pass 2 (locked in)
-                summary         TEXT    DEFAULT '',  -- one-line AI-generated description
-                pass1_output    TEXT    DEFAULT '',
-                pass2_output    TEXT    DEFAULT '',
-                pass3_output    TEXT    DEFAULT '',
-                pass4_output    TEXT    DEFAULT '',
-                pass5_output    TEXT    DEFAULT '',
-                pass6_output    TEXT    DEFAULT '',
-                final_cpp       TEXT    DEFAULT '',
-                analyzed_at     TEXT    DEFAULT (datetime('now'))
+                {columns_sql}
             );
 
             CREATE TABLE IF NOT EXISTS recovered_types (
@@ -76,6 +87,24 @@ class SemanticDB:
                 description TEXT    DEFAULT ''
             );
             """)
+            self._migrate_functions_columns(conn)
+
+    def _migrate_functions_columns(self, conn):
+        """
+        Retrofit any `_FUNCTIONS_COLUMNS` entries missing from an existing
+        `functions` table — `CREATE TABLE IF NOT EXISTS` only helps brand-new
+        databases; a database created before a schema change would otherwise
+        crash on the first read/write of the new column (this has already
+        happened once, with `pass6_output`).
+        """
+        existing = {row["name"] for row in conn.execute("PRAGMA table_info(functions)")}
+        for col, ddl in self._FUNCTIONS_COLUMNS.items():
+            if col in existing:
+                continue
+            try:
+                conn.execute(f"ALTER TABLE functions ADD COLUMN {col} {ddl}")
+            except sqlite3.OperationalError:
+                pass  # e.g. a non-constant DEFAULT, which ADD COLUMN can't take
 
     # ------------------------------------------------------------------
     # Functions table
@@ -111,6 +140,20 @@ class SemanticDB:
     def get_ai_name(self, address: str) -> str:
         fn = self.get_function(address)
         return (fn.get("ai_name") or "") if fn else ""
+
+    def set_provider(self, address: str, provider: str):
+        with self._conn() as conn:
+            conn.execute("UPDATE functions SET provider = ? WHERE address = ?", (provider, address))
+
+    def is_complete_for_provider(self, address: str, provider: str) -> bool:
+        """
+        True if this function already has a final result produced by this
+        exact provider — used to skip re-translating on a resumed run.
+        A stored result from a *different* provider doesn't count as done,
+        since switching providers is a deliberate choice to get fresh output.
+        """
+        fn = self.get_function(address)
+        return bool(fn and fn.get("final_cpp") and fn.get("provider") == provider)
 
     def set_summary(self, address: str, summary: str):
         with self._conn() as conn:

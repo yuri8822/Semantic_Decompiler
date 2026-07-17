@@ -37,6 +37,9 @@ ghidra_project/
 # PrismML's llama.cpp fork (Bonsai 1-bit support) — built locally, not source
 llama.cpp/
 
+# Model weights (large, downloaded separately)
+*.gguf
+
 # ── IDE ─────────────────────────────────────────────────────────────────────
 .vscode/
 .idea/

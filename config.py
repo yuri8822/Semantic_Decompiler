@@ -36,9 +36,10 @@ OLLAMA_MODEL    = "carstenuhlig/omnicoder-9b:q4_k_m"
 # Bonsai 27B (1-bit, local) — llama.cpp server via PrismML's fork, vendored at
 # ai/providers/bonsai/llama.cpp/ (gitignored; prebuilt Windows CUDA binaries
 # live under llama.cpp/bin/extracted/, no build required)
-# https://huggingface.co/prism-ml/Bonsai-27B-gguf (Bonsai-27B-Q1_0.gguf)
+# Weights: ai/providers/bonsai/model/Bonsai-27B-Q1_0.gguf (gitignored, *.gguf)
+# from https://huggingface.co/prism-ml/Bonsai-27B-gguf
 # Start the server first, from ai/providers/bonsai/llama.cpp/bin/extracted/:
-#   ./llama-server.exe -m <path-to>/Bonsai-27B-Q1_0.gguf --host 0.0.0.0 --port 8080 -ngl 99
+#   ./llama-server.exe -m ../../../model/Bonsai-27B-Q1_0.gguf --host 0.0.0.0 --port 8080 -ngl 99
 BONSAI_BASE_URL   = "http://localhost:8080/v1"
 BONSAI_MODEL      = "Bonsai-27B-Q1_0"  # sent in the request; llama-server ignores it and serves whatever's loaded
 BONSAI_MAX_TOKENS = 4096

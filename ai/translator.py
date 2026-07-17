@@ -73,17 +73,36 @@ def extract_function_name(code: str, fallback: str) -> str:
     return fallback
 
 
+def _is_call_site(name: str, line: str) -> bool:
+    """
+    True if `name(` on this line looks like an actual call, not a forward
+    declaration or definition signature — i.e. not `[extern] TYPE name(...)`
+    (with or without a trailing `{` or `;`).
+    """
+    if not re.search(r'\b' + re.escape(name) + r'\s*\(', line):
+        return False
+    signature = re.compile(r'^(extern\s+)?[A-Za-z_]\w*(\s*\*)*\s+' + re.escape(name) + r'\s*\(')
+    return not signature.match(line.strip())
+
+
 def _dropped_callees(before: str, after: str, callees: list[str]) -> set[str]:
     """
-    Return callees that were present in `before` but are absent in `after`.
-    Only checks names that actually appeared in `before` — so if a callee was
-    already renamed in a prior pass it won't appear in `before` and won't fire.
+    Return callees that were actually being CALLED in `before` but no longer
+    are in `after`. Checks real call sites rather than bare name presence —
+    a model can delete a function's real implementation while leaving a
+    stale `extern` declaration behind that reuses the same name, which would
+    make the callee look "still present" even though nothing calls it
+    anymore. Only checks names that were genuinely called in `before` — so if
+    a callee was already renamed in a prior pass it won't have been a call
+    site under the old name there either, and won't fire.
     """
-    return {
-        name for name in callees
-        if re.search(r'\b' + re.escape(name) + r'\b', before)
-        and not re.search(r'\b' + re.escape(name) + r'\b', after)
-    }
+    dropped = set()
+    for name in callees:
+        called_before = any(_is_call_site(name, line) for line in before.split("\n"))
+        called_after = any(_is_call_site(name, line) for line in after.split("\n"))
+        if called_before and not called_after:
+            dropped.add(name)
+    return dropped
 
 
 class MultiPassTranslator:
@@ -91,6 +110,7 @@ class MultiPassTranslator:
                  provider: str = LLM_PROVIDER, ollama_model: str = OLLAMA_MODEL):
         self.db = db
         self.num_passes = min(num_passes, NUM_PASSES)
+        self.provider = provider.lower()
         self._llm = LLMClient(provider=provider, ollama_model=ollama_model)
 
     def translate(
@@ -107,6 +127,10 @@ class MultiPassTranslator:
         current_code = function_data.get("decompiled", "")
         if not current_code.strip():
             return f"// {name}: decompiler produced no output\nvoid {name}() {{}}\n"
+
+        # Mark which provider is (re)producing this function's results, so a
+        # resumed run can tell "already done" from "done by someone else"
+        self.db.set_provider(address, self.provider)
 
         # Fetch shared context (types discovered so far, neighbour summaries)
         recovered_types = self.db.get_types_for_context()

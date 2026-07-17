@@ -221,6 +221,123 @@ and got Bonsai actually runnable locally.
 
 ---
 
+## What was built — session 6
+
+First real end-to-end test run (`--provider bonsai --skip-ghidra --limit 1`
+against `find.exe`'s `FUN_140001010`) surfaced a genuine bug in the session-3
+callee guard, independent of which provider is used.
+
+### What the test run found
+Traced the corruption pass-by-pass via `semantic.db`'s `pass1_output` ...
+`pass6_output` columns. Passes 1-2 were fine (real logic preserved). Pass 3
+(type inference) violated its own system prompt — instead of adding type defs
+*above* the function, it deleted the function body entirely, leaving only
+`extern` declarations reusing the callees' names. Pass 4 found no body to
+work from and fabricated one from scratch (`push reg r13, [0]` repeated 17
+times — not present anywhere in the real p-code or decompiled input; pure
+hallucination). Passes 5-6 carried the fabricated body forward unchanged.
+
+The session-3 callee guard didn't catch this because it only checked whether
+a callee's name appeared *anywhere in the text*, not whether it was actually
+*called*. Pass 3's broken output still contained `extern void
+__set_app_type(int app_type);` etc. — the names were technically "present,"
+just as dead declarations instead of live calls — so the guard saw no drop.
+
+### `ai/translator.py`
+- Replaced `_dropped_callees`'s bare-name-presence check with a real
+  call-site check (`_is_call_site`): a line only counts as evidence the
+  callee is used if `name(` appears there and the line doesn't match a
+  `[extern] TYPE name(` signature pattern (forward declaration or
+  definition). A callee now has to have gone from "actually called somewhere
+  in `before`" to "not called anywhere in `after`" to trigger a revert.
+- Verified against the real captured DB history from the test run above: the
+  fixed check correctly flags all 4 callees as dropped at the pass 2 -> pass 3
+  transition (where the old check saw nothing wrong), and produces zero false
+  positives against unchanged code with real call sites.
+- This fix is provider-agnostic — it lives in the shared multi-pass loop, not
+  in any provider file, so it protects against this failure mode regardless
+  of which backend (Anthropic/Xiaomi/Ollama/Bonsai) produced the bad pass.
+
+### Open question this test raised, not yet answered
+Whether Bonsai 27B (1-bit)'s output quality is usable for this pipeline at
+all is still unresolved — this was one small function on a heavily quantized
+model attempting a demanding structured task, and it violated the "AI must
+not invent logic" invariant on the very first non-trivial pass. A fair
+verdict needs the same function run through another provider for comparison
+before concluding anything about Bonsai specifically (see edge case below).
+
+---
+
+## What was built — session 7
+
+Provider-aware resume, step 1 of 4 (see `nifty-popping-steele.md` plan).
+Motivation: a long unattended Bonsai run (planned: ~50 functions x 6 passes
+at local inference speed) had zero resume capability — an interruption at
+any point meant redoing every function from scratch, even ones that had
+already finished cleanly.
+
+### `analyzer/types_db.py`
+- Added a `provider` column to `functions`, tracking which LLM backend
+  produced the row's *current* results.
+- Generalized the schema-migration problem instead of patching it again:
+  `_FUNCTIONS_COLUMNS` is now the single source of truth for both the
+  `CREATE TABLE` (new databases) and a new `_migrate_functions_columns()`
+  step in `init()` that `ALTER TABLE ADD COLUMN`s anything missing from an
+  existing database. This is the second time a new column broke existing
+  local `semantic.db` files (first was `pass6_output`, session 3) — fixed
+  properly this time so it doesn't happen a third time.
+- Added `set_provider(address, provider)` and `is_complete_for_provider(address,
+  provider) -> bool` (true only if `final_cpp` is non-empty *and* `provider`
+  matches exactly — a result from a different provider doesn't count as done).
+
+### `ai/translator.py`
+- `MultiPassTranslator` now stores its own `provider` and calls
+  `db.set_provider(address, self.provider)` at the start of `translate()`,
+  before the pass loop. Existing upsert semantics on `set_pass_output`/
+  `set_final_cpp` already overwrite stale data when a function legitimately
+  gets reprocessed — no explicit wipe needed.
+
+### `main.py`
+- The per-function loop now checks `db.is_complete_for_provider(fn.address,
+  args.provider.lower())` before calling `translator.translate()`. On a hit,
+  it pulls `final_cpp`/`ai_name` straight from the DB and calls
+  `writer.add_function()` without touching the LLM at all — shown in the
+  progress bar as `(cached)`.
+
+### Verified against the real database (not just synthetic data)
+- Ran the schema migration against the actual `semantic.db` accumulated
+  from earlier testing — confirmed the `provider` column was added cleanly
+  with no data loss.
+- The `find.exe` / `FUN_140001010` row already had a `final_cpp` from
+  earlier Bonsai testing, but predated this feature, so its `provider` was
+  blank — correctly did *not* count as done (fails toward reprocessing
+  rather than assuming a match on unknown history). First real run after
+  the change reprocessed it for real (~65s of actual LLM calls) and
+  backfilled `provider='bonsai'`.
+- Second real run of the identical command completed in **1.8 seconds** and
+  showed `FUN_140001010 (cached)` in the progress bar — confirmed no request
+  reached the running `llama-server` (timing alone rules it out; a real run
+  takes over a minute).
+- Confirmed provider-mismatch handling directly against the now-populated
+  row: `is_complete_for_provider(addr, "bonsai")` → `True`,
+  `is_complete_for_provider(addr, "anthropic")` → `False`,
+  `is_complete_for_provider(addr, "ollama")` → `False`. (Couldn't run a live
+  end-to-end `--provider anthropic` check — no Anthropic API key is
+  configured in this environment — but the actual skip-decision function is
+  the same one exercised above, just with a different provider string.)
+
+### Remaining steps (not yet built, per the approved plan)
+2. Incremental output writing — `writer.write()` currently only runs once,
+   after the *entire* function loop finishes, so a crash before that point
+   still loses all output files even though the DB has complete data.
+3. Pass-level resume within a function — currently a function that gets
+   reprocessed always restarts at pass 1, even if passes 1-3 already
+   completed under the same provider.
+4. Auto-detect Ghidra export reuse — `--skip-ghidra` still has to be passed
+   manually; nothing yet checks whether an export already exists by default.
+
+---
+
 ## Known limitations / next steps
 
 ### Still to build
@@ -254,17 +371,25 @@ and got Bonsai actually runnable locally.
    absolute path (currently a local dev path). Update it before running on
    another machine.
 
-6. **Callee guard blind spot** — the pass ≥3 callee-drop check (see session 3,
-   `ai/translator.py`) only fires while a callee's *original* Ghidra name is
-   still literally present in the code. Once pass 2 renames a callee's call
-   site, that callee is unprotected for the rest of the pipeline. Future:
+6. **Callee guard blind spot** — the pass ≥3 callee-drop check (`ai/translator.py`,
+   hardened in session 6 to check real call sites instead of bare name
+   presence — see session 6) only fires while a callee's *original* Ghidra
+   name is still being called under that name. Once pass 2 renames a
+   callee's call site, that callee is unprotected for the rest of the
+   pipeline — this part of the gap is unchanged by the session 6 fix. Future:
    track renamed callee names too, not just the original list.
 
-7. **Bonsai provider is untested against a live server** — `bonsai_provider.py`
-   assumes reasoning (if any) shows up as an inline `<think>...</think>` block
-   in `message.content` and strips it with a regex. Once the PrismML llama.cpp
-   fork is actually running Bonsai-27B-Q1_0.gguf, verify the raw response shape
-   — if reasoning instead arrives in a separate `reasoning_content` field, or
-   the model needs a `--reasoning-format` server flag, the stripping is a
-   harmless no-op but should be revisited. Also unverified: whether the
-   `model` field in the request needs to match anything the server expects.
+7. ~~Bonsai provider is untested against a live server~~ **Resolved 2026-07-17.**
+   Verified against a real running server (`Bonsai-27B-Q1_0.gguf` via the
+   PrismML fork): reasoning is on by default (Qwen3-style template) and
+   arrives in `message.reasoning_content`, not inline `<think>` tags — and
+   without a fix, a request could burn its entire `max_tokens` budget on the
+   reasoning trace and return `content=""` (`finish_reason="length"`),
+   silently feeding empty output into the translator. Fixed in
+   `bonsai_provider.py` by passing `extra_body={"chat_template_kwargs":
+   {"enable_thinking": False}}` on every request (suppresses reasoning
+   entirely, confirmed `content` now has the real answer with
+   `finish_reason="stop"`), plus a guard that raises `RuntimeError` if
+   content ever comes back empty alongside a reasoning trace. The `model`
+   field in the request does not need to match anything — confirmed the
+   server ignores it and serves whatever's loaded regardless of the string sent.

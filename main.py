@@ -198,6 +198,19 @@ def main():
         task = progress.add_task("Reconstructing...", total=len(functions))
 
         for fn in functions:
+            # Resume support: a prior run may have already fully translated
+            # this function with this exact provider — reuse it instead of
+            # burning another 6-pass round trip. A result from a *different*
+            # provider doesn't count; switching providers means you want
+            # fresh output, not someone else's cached answer.
+            if db.is_complete_for_provider(fn.address, args.provider.lower()):
+                progress.update(task, description=f"[dim]{fn.name[:30]} (cached)[/dim]")
+                cached = db.get_function(fn.address)
+                ai_name = cached.get("ai_name") or fn.name
+                writer.add_function(ai_name, fn.address, cached["final_cpp"], fn.signature)
+                progress.advance(task)
+                continue
+
             progress.update(task, description=f"[cyan]{fn.name[:38]}[/cyan]")
 
             ir          = build_ir(fn, addr_map=addr_map)

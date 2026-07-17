@@ -181,10 +181,11 @@ are enough; no compiler/MSVC needed.
 git clone https://github.com/PrismML-Eng/llama.cpp
 # grab the Windows CUDA release asset + cudart runtime from the fork's GitHub
 # releases page and extract both into llama.cpp/bin/extracted/
-# then download Bonsai-27B-Q1_0.gguf from prism-ml/Bonsai-27B-gguf
+# then download Bonsai-27B-Q1_0.gguf into ai/providers/bonsai/model/
+# (both llama.cpp/ and *.gguf are gitignored)
 
 cd llama.cpp/bin/extracted
-./llama-server.exe -m <path-to>/Bonsai-27B-Q1_0.gguf --host 0.0.0.0 --port 8080 -ngl 99
+./llama-server.exe -m ../../../model/Bonsai-27B-Q1_0.gguf --host 0.0.0.0 --port 8080 -ngl 99
 
 # in another terminal
 python main.py target.exe --provider bonsai
