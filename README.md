@@ -172,13 +172,19 @@ llama.cpp doesn't have the required `Q1_0_g128` kernels) and the
 [`Bonsai-27B-gguf`](https://huggingface.co/prism-ml/Bonsai-27B-gguf) weights
 (the true 1-bit repo — not `Ternary-Bonsai-27B-gguf`).
 
-```bash
-# one-time setup — clone and build (see the fork's README for build flags), then
-# download Bonsai-27B-Q1_0.gguf from prism-ml/Bonsai-27B-gguf
-git clone https://github.com/PrismML-Eng/llama.cpp
-cd llama.cpp && cmake -B build && cmake --build build --config Release
+The fork is vendored at `ai/providers/bonsai/llama.cpp/` (gitignored — it's a
+built local dependency, not project source). Prebuilt Windows CUDA binaries
+are enough; no compiler/MSVC needed.
 
-./build/bin/llama-server -m Bonsai-27B-Q1_0.gguf --host 0.0.0.0 --port 8080 -ngl 99
+```bash
+# one-time setup, from ai/providers/bonsai/:
+git clone https://github.com/PrismML-Eng/llama.cpp
+# grab the Windows CUDA release asset + cudart runtime from the fork's GitHub
+# releases page and extract both into llama.cpp/bin/extracted/
+# then download Bonsai-27B-Q1_0.gguf from prism-ml/Bonsai-27B-gguf
+
+cd llama.cpp/bin/extracted
+./llama-server.exe -m <path-to>/Bonsai-27B-Q1_0.gguf --host 0.0.0.0 --port 8080 -ngl 99
 
 # in another terminal
 python main.py target.exe --provider bonsai
@@ -206,10 +212,11 @@ ai/
   prompts.py                — Per-pass system prompts and user prompt builder
   providers/
     base.py                 — BaseProvider ABC (one method: complete)
-    anthropic_provider.py    — Claude, heavy/fast model split for passes 3-4
-    xiaomi_provider.py       — MiMo, Anthropic-compatible API
-    ollama_provider.py       — Local, OpenAI-compatible endpoint
-    bonsai_provider.py       — Local Bonsai 27B (1-bit), OpenAI-compatible endpoint
+    anthropic/anthropic_provider.py — Claude, heavy/fast model split for passes 3-4
+    xiaomi/xiaomi_provider.py       — MiMo, Anthropic-compatible API
+    ollama/ollama_provider.py       — Local, OpenAI-compatible endpoint
+    bonsai/bonsai_provider.py       — Local Bonsai 27B (1-bit), OpenAI-compatible endpoint
+    bonsai/llama.cpp/               — Vendored PrismML fork (gitignored) + prebuilt binaries
 
 output/
   writer.py                 — Writes recovered.h, recovered.cpp, function_index.txt

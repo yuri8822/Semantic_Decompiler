@@ -33,6 +33,10 @@ output/recovered/
 # The .gpr and .rep are local workspace state, not source
 ghidra_project/
 
+# ── Vendored inference engines ──────────────────────────────────────────────
+# PrismML's llama.cpp fork (Bonsai 1-bit support) — built locally, not source
+llama.cpp/
+
 # ── IDE ─────────────────────────────────────────────────────────────────────
 .vscode/
 .idea/

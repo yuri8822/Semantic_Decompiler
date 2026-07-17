@@ -20,10 +20,11 @@
 | `ai/prompts.py` | Done | 6 pass-specific system prompts + context assembler |
 | `ai/llm_client.py` | Done | Thin facade — picks a provider from `ai/providers/` and forwards `complete()` |
 | `ai/providers/base.py` | Done | `BaseProvider` ABC — the one method (`complete`) every provider implements |
-| `ai/providers/anthropic_provider.py` | Done | Heavy/fast model split for passes 3/4 vs the rest |
-| `ai/providers/xiaomi_provider.py` | Done | Anthropic-compatible API, one model for all passes |
-| `ai/providers/ollama_provider.py` | Done | Local, OpenAI-compatible endpoint, one configured model |
-| `ai/providers/bonsai_provider.py` | Done | Local Bonsai 27B (1-bit) via llama.cpp's OpenAI-compatible server; strips a leading `<think>` block |
+| `ai/providers/anthropic/anthropic_provider.py` | Done | Heavy/fast model split for passes 3/4 vs the rest |
+| `ai/providers/xiaomi/xiaomi_provider.py` | Done | Anthropic-compatible API, one model for all passes |
+| `ai/providers/ollama/ollama_provider.py` | Done | Local, OpenAI-compatible endpoint, one configured model |
+| `ai/providers/bonsai/bonsai_provider.py` | Done | Local Bonsai 27B (1-bit) via llama.cpp's OpenAI-compatible server; strips a leading `<think>` block |
+| `ai/providers/bonsai/llama.cpp/` | Done | Vendored PrismML fork (gitignored) + prebuilt Windows CUDA binaries under `bin/extracted/` |
 | `ai/translator.py` | Done | Multi-pass LLM pipeline (provider-agnostic), type harvesting, summaries |
 | `output/__init__.py` | Done | Package marker |
 | `output/writer.py` | Done | Writes `recovered.h`, `recovered.cpp`, `function_index.txt` |
@@ -190,6 +191,33 @@ fourth provider: Bonsai 27B (1-bit, local).
 ### `config.py` / `main.py`
 - Added `BONSAI_BASE_URL`, `BONSAI_MODEL`, `BONSAI_MAX_TOKENS`; `LLM_PROVIDER`
   and `--provider` now both accept `"bonsai"`.
+
+---
+
+## What was built — session 5
+
+Reorganized each provider into its own subfolder (rather than a flat file),
+and got Bonsai actually runnable locally.
+
+### `ai/providers/`
+- Each provider is now `ai/providers/<name>/<name>_provider.py` with its own
+  `__init__.py` (e.g. `ai/providers/anthropic/anthropic_provider.py`), not a
+  flat file directly under `providers/`. `base.py` stays directly under
+  `ai/providers/` since it's shared. `ai/providers/__init__.py`'s imports were
+  updated to the new module paths; nothing else needed to change since the
+  `ai.providers.base` import path didn't move.
+- `ai/providers/bonsai/llama.cpp/` — PrismML's llama.cpp fork is now vendored
+  *inside* the provider's own folder instead of the project root (still
+  gitignored — see note below on why the same pattern still works after the move).
+  Prebuilt Windows CUDA binaries (no MSVC/build step needed) live at
+  `ai/providers/bonsai/llama.cpp/bin/extracted/llama-server.exe`, downloaded
+  from the fork's GitHub releases (`llama-prism-*-bin-win-cuda-12.4-x64.zip`
+  + `cudart-llama-bin-win-cuda-12.4-x64.zip`).
+
+### `.gitignore`
+- No change needed. The existing `llama.cpp/` entry has only a trailing slash
+  (no leading/middle slash), so per gitignore's matching rules it already
+  matches a `llama.cpp` directory at any depth, not just at the project root.
 
 ---
 

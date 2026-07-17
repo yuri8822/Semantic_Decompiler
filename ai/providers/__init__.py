@@ -3,10 +3,10 @@ Provider registry — each LLM backend lives in its own file so it can be
 tuned independently without touching the others.
 """
 
-from ai.providers.anthropic_provider import AnthropicProvider
-from ai.providers.xiaomi_provider import XiaomiProvider
-from ai.providers.ollama_provider import OllamaProvider
-from ai.providers.bonsai_provider import BonsaiProvider
+from ai.providers.anthropic.anthropic_provider import AnthropicProvider
+from ai.providers.xiaomi.xiaomi_provider import XiaomiProvider
+from ai.providers.ollama.ollama_provider import OllamaProvider
+from ai.providers.bonsai.bonsai_provider import BonsaiProvider
 
 _REGISTRY = {
     "anthropic": AnthropicProvider,

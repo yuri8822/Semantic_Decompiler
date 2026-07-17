@@ -3,14 +3,17 @@ Bonsai 27B (1-bit) — local provider, via llama.cpp's OpenAI-compatible
 server. Requires PrismML's llama.cpp fork (the Q1_0_g128 hybrid-attention
 kernels aren't in vanilla llama.cpp): https://github.com/PrismML-Eng/llama.cpp
 
+The fork is vendored at ai/providers/bonsai/llama.cpp/ (gitignored — it's a
+built local dependency, not project source). Prebuilt Windows CUDA binaries
+live at ai/providers/bonsai/llama.cpp/bin/extracted/ (no compilation needed;
+MSVC isn't required since these ship prebuilt).
+
 Model weights: https://huggingface.co/prism-ml/Bonsai-27B-gguf
 (Bonsai-27B-Q1_0.gguf — this is the true 1-bit repo, not the
 Ternary-Bonsai-27B-gguf variant).
 
-One-time local setup (outside this repo):
-    git clone https://github.com/PrismML-Eng/llama.cpp
-    # build it, then download Bonsai-27B-Q1_0.gguf from the repo above
-    ./build/bin/llama-server -m Bonsai-27B-Q1_0.gguf --host 0.0.0.0 --port 8080 -ngl 99
+Start the server from ai/providers/bonsai/llama.cpp/bin/extracted/:
+    ./llama-server.exe -m <path-to>/Bonsai-27B-Q1_0.gguf --host 0.0.0.0 --port 8080 -ngl 99
 
 PrismML's docs describe the 27B variant as served with "thinking"
 enabled by default, so a response may be prefixed with a
