@@ -113,18 +113,9 @@ class ProjectWriter:
 
     def _extract_type_definitions(self) -> list[str]:
         """Pull struct/class/enum/typedef blocks out of all function bodies."""
-        type_pattern = re.compile(
-            r'^((?:struct|class|enum(?:\s+class)?|typedef\s+struct|typedef\s+enum)'
-            r'\s+\w+[^;]*\{[^}]*\}\s*(?:\w+\s*)?;)',
-            re.MULTILINE | re.DOTALL
-        )
         seen: dict[str, str] = {}
         for fn in self._functions:
-            for m in type_pattern.finditer(fn.cpp):
-                defn = m.group(1).strip()
-                # Key by the first identifier after the keyword
-                name_m = re.search(r'(?:struct|class|enum\s+class|enum|typedef\s+\w+)\s+(\w+)', defn)
-                key = name_m.group(1) if name_m else defn[:30]
+            for defn, key in _find_type_definitions(fn.cpp):
                 if key not in seen:
                     seen[key] = defn
 
@@ -138,6 +129,52 @@ class ProjectWriter:
 # ---------------------------------------------------------------------------
 # Module-level helpers
 # ---------------------------------------------------------------------------
+
+_TYPE_START_RE = re.compile(
+    r'^(?:struct|class|enum(?:\s+class)?|typedef\s+struct|typedef\s+enum)'
+    r'\s+(?P<name>\w+)\b[^{;]*\{',
+    re.MULTILINE
+)
+
+
+def _matching_brace(code: str, open_pos: int):
+    """Index of the `}` that closes the `{` at `open_pos`, or None if unbalanced."""
+    depth = 0
+    for i in range(open_pos, len(code)):
+        if code[i] == "{":
+            depth += 1
+        elif code[i] == "}":
+            depth -= 1
+            if depth == 0:
+                return i
+    return None
+
+
+def _find_type_definitions(code: str):
+    """
+    Yield (definition_text, name) for each top-level struct/class/enum/
+    typedef block in `code`, using real brace-depth matching instead of a
+    single-level regex. A naive `\\{[^}]*\\}` can't handle a class with an
+    inline method body (its own nested braces) — it truncates at the first
+    inner `}` it finds (e.g. a constructor's closing brace) rather than the
+    type's own closing brace, silently emitting a broken fragment that reads
+    as complete syntax (`class X { ... };`) but isn't actually the whole
+    class. This showed up for real: a `CRTStartup` class with an inline
+    constructor got truncated this way, leaving its real closing brace
+    missing and several unrelated classes accidentally nested inside it in
+    the generated header.
+    """
+    for m in _TYPE_START_RE.finditer(code):
+        open_brace = m.end() - 1
+        close_brace = _matching_brace(code, open_brace)
+        if close_brace is None:
+            continue  # unbalanced in the source — skip rather than emit a truncated fragment
+        tail = re.match(r'\s*(\w*)\s*;', code[close_brace + 1: close_brace + 41])
+        if not tail:
+            continue  # not actually followed by a declarator/`;` — not a complete definition
+        end = close_brace + 1 + tail.end()
+        yield code[m.start():end].strip(), m.group("name")
+
 
 def _declaration(fn: "_FnRecord") -> str:
     """

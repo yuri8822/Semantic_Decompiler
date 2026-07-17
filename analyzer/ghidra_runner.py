@@ -5,7 +5,6 @@ to the JSON export produced by ExportAnalysis.java.
 
 import re
 import subprocess
-import sys
 from pathlib import Path
 
 from config import (
@@ -45,24 +44,39 @@ def analyze_binary(binary_path: str, overwrite: bool = True, verbose: bool = Fal
         str(GHIDRA_JSON_DIR.resolve()),   # <-- script arg: absolute output dir
     ]
 
-    # Always capture output so we can surface it on failure.
-    result = subprocess.run(cmd, capture_output=True, text=True)
+    # Stream output live instead of buffering it all until the process exits
+    # (subprocess.run(capture_output=True) used to do exactly that, so
+    # --verbose had nothing to show until Ghidra finished or crashed — on a
+    # long-running analysis that's an unmonitorable multi-hour black box).
+    # Still captured in full either way, so the existing failure diagnostics
+    # below are unaffected. stderr is merged into stdout so a crash trace
+    # printed there (e.g. the OutOfMemoryError abort that motivated this
+    # fix) shows up in both the live stream and the captured snippet,
+    # instead of only being visible in Ghidra's own application.log.
+    output_lines = []
+    process = subprocess.Popen(
+        cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        text=True, bufsize=1,
+    )
+    for line in process.stdout:
+        output_lines.append(line)
+        if verbose:
+            print(line, end="")
+    process.wait()
+    captured = "".join(output_lines)
 
-    if verbose or result.returncode != 0:
-        if result.stdout:
-            print(result.stdout)
-        if result.stderr:
-            print(result.stderr, file=sys.stderr)
+    if not verbose and process.returncode != 0:
+        print(captured)
 
-    if result.returncode != 0:
+    if process.returncode != 0:
         raise RuntimeError(
-            f"Ghidra exited with code {result.returncode}. "
+            f"Ghidra exited with code {process.returncode}. "
             "Re-run with --verbose to see full output."
         )
 
     if not output_path.exists():
         # Surface Ghidra's output so the user can see if the script errored
-        snippet = (result.stdout or "")[-3000:]
+        snippet = captured[-3000:]
         raise RuntimeError(
             f"Ghidra completed but export not found: {output_path}\n"
             f"Ghidra output (last 3 KB):\n{snippet}"

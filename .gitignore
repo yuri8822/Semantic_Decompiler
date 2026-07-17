@@ -25,6 +25,7 @@ data/ghidra_json/
 
 # Input binaries (don't commit third-party executables)
 data/binaries/
+TestBinaries/
 
 # AI-generated output (reproducible from source + binary)
 output/recovered/

@@ -549,6 +549,291 @@ with no error or warning.
 
 ---
 
+## What was built — session 12
+
+Real production incident, not a code review this time: a `python main.py
+"TestBinaries\SpeedRunners.exe" --provider bonsai` run appeared to hang
+during Ghidra analysis for 2+ hours with the process still apparently
+running.
+
+### Diagnosis
+Filesystem timestamps (`ghidra_project/`, no new `data/ghidra_json/` export)
+showed zero activity for over an hour — inconsistent with genuinely-slow
+analysis, which should be constantly writing to Ghidra's project database.
+Ghidra's own `application.log` (`%APPDATA%/ghidra/ghidra_11.2.1_PUBLIC/`)
+had the real answer: a `java.lang.OutOfMemoryError: Java heap space`, thrown
+from deep inside decoding one function's decompiled output (repeated
+`ClangTokenGroup.decode` recursion in the stack trace — a single function
+producing an enormous decompiled representation), logged by
+`HeadlessAnalyzer` as an abort of the *entire* run — not a graceful skip of
+just that function.
+
+Root cause in `ghidra_scripts/ExportAnalysis.java`: the per-function export
+loop already had a `try { ... } catch (Exception e)` meant to isolate one
+bad function from the rest — but `OutOfMemoryError` extends Java's `Error`,
+not `Exception`. They're sibling branches under `Throwable`, so the catch
+never saw it, and it propagated straight past the loop's safety net and
+killed analysis of the whole binary.
+
+### Fix — `ghidra_scripts/ExportAnalysis.java`
+- Broadened the catch from `Exception e` to `Throwable t`, so a single
+  pathological function (memory-hungry decompile, or any other `Error`) gets
+  logged and skipped instead of aborting the entire binary's analysis.
+- Warning message now includes the throwable's class name
+  (`t.getClass().getSimpleName()`), not just its message — `"Java heap
+  space"` alone doesn't say what kind of failure it was; `"OutOfMemoryError:
+  Java heap space"` does.
+- Added a best-effort `System.gc()` specifically after an `OutOfMemoryError`,
+  to encourage reclaiming that function's partial decode state before the
+  loop moves on to the next (much smaller) function.
+- The user is separately increasing Ghidra's JVM heap size to make hitting
+  this in the first place less likely — the two fixes are complementary:
+  more headroom reduces frequency, the broadened catch bounds the damage
+  when a function still exceeds it regardless of heap size. Correction:
+  initially pointed at `MAXMEM` in `<ghidra_install>/support/launch.properties`
+  — wrong for Ghidra 11.x. Checked the actual install: `analyzeHeadless.bat`
+  hardcodes `set MAXMEM=2G` itself (line 9) and passes it to `launch.bat`,
+  which only appends `-Xmx%MAXMEM%` if that variable is non-empty;
+  `launch.properties` isn't involved in setting it at all for headless runs.
+  The real fix is editing `MAXMEM=2G` directly in `analyzeHeadless.bat`.
+
+---
+
+## What was built — session 13
+
+Follow-up from session 12: `--verbose` turned out not to do what its own
+docstring implied. Recommended it to the user for live visibility into a
+long Ghidra run, but a minute in they reported seeing nothing beyond
+`[1/4] Running Ghidra headless analysis...` — checking the code confirmed
+why.
+
+### The bug — `analyzer/ghidra_runner.py`
+`analyze_binary()` used `subprocess.run(cmd, capture_output=True,
+text=True)`, which blocks and buffers all output in memory until the
+process fully exits; `verbose` only controlled whether that already-fully-
+captured output got printed *afterward*. There was never a way for
+`--verbose` to show anything mid-run — on a long analysis (exactly the
+scenario it exists for) it was a silent black box regardless of the flag,
+identical to non-verbose except for what got dumped at the very end.
+
+### Fix
+Replaced `subprocess.run(capture_output=True)` with `subprocess.Popen` +
+`for line in process.stdout: ...`, printing each line immediately when
+`verbose=True` while still accumulating the full text so the existing
+failure diagnostics (non-zero exit message, last-3KB snippet when the
+export file is missing) work exactly as before. Also merged `stderr` into
+`stdout` (`stderr=subprocess.STDOUT`) — a crash trace printed to stderr
+(like the OutOfMemoryError from session 12) now shows up in both the live
+stream and the captured failure snippet, instead of only being visible in
+Ghidra's own `application.log`. Removed the now-unused `sys` import.
+
+One honest caveat noted for the user, not resolved: this fixes buffering on
+the *Python* side. Whether output appears truly line-by-line also depends
+on whether the JVM itself buffers differently when its stdout is a pipe
+rather than a real terminal — plausible but unverified given the current
+circumstances (a live production run in progress, not a moment to
+experiment on).
+
+### Verification
+Confirmed safe without touching the user's in-progress Ghidra run: syntax-
+checked the file and imported the module (which only loads the function
+definition, never calls it) — deliberately did *not* invoke `analyze_binary()`
+itself, since doing so would have tried to open the same Ghidra project the
+user's live process had locked. The user closed that process manually and
+unrelated to this change; confirmed via `tasklist` before and after that the
+edit itself had zero effect on the running process either way.
+
+---
+
+## What was built — session 14
+
+First real multi-function AI-reconstruction run against a well-symboled
+native binary (`Chess.exe`, DWARF debug info present, 41 functions
+completed via Bonsai before being stopped for review). Spot-checking the
+actual output surfaced a real, previously undocumented bug in
+`output/writer.py` — worse than the known "nested types aren't extracted"
+limitation from session 2's edge-case list, since this one doesn't just
+skip a type, it emits a *broken* one.
+
+### The bug
+`recovered.h`'s brace count was verified off by one at EOF (`+1`, not `0`).
+`class CRTStartup { public: CRTStartup() { ... }; ...` — a class with an
+inline constructor body — has its own nested `{ }`. The old
+`_extract_type_definitions()` regex (`\{[^}]*\}`) can't track nesting, so it
+matched only up to the *constructor's* closing brace, then found a `;`
+right after (`};`) and treated that as a complete `class X { ... };` — a
+genuinely different, unrelated class definition. Several unrelated classes
+(`Engine`, `StreamImpl`, `string`, a nested `struct std::string`) ended up
+accidentally nested inside the still-open `CRTStartup`, and the header
+would not compile. The AI itself wasn't at fault here — a complete, correct
+`CRTStartup` definition existed later in the same file (in that function's
+own section); the bug was `output/writer.py` deduplicating by first-seen
+name and keeping the broken occurrence over the correct one.
+
+### Fix — `output/writer.py`
+Replaced the single-level regex with real brace-depth matching:
+`_TYPE_START_RE` finds where a type definition starts, `_matching_brace()`
+scans character-by-character tracking depth to find the *true* matching
+closing brace (handles arbitrarily nested braces, unlike regex), and
+`_find_type_definitions()` ties them together — skipping (not emitting a
+fragment for) anything unbalanced in the source, and requiring the closing
+brace be followed by an optional declarator and `;` within a short bounded
+window (not an unbounded scan that could reach into unrelated later code).
+
+### Verification against the real bug, not synthetic data
+Pulled all 41 of `Chess.exe`'s completed `final_cpp` rows directly from
+`semantic.db`, fed them through a real `ProjectWriter`, and rebuilt
+`recovered.h`. Brace depth at EOF: `0` (was `1`). `CRTStartup` now correctly
+captures its full body — constructor, destructor, and the `Init()` method
+with its nested `while` loop — instead of truncating after the
+constructor's closing brace.
+
+### Follow-up fix — `ai/translator.py`
+`_harvest_types` had the exact same single-level-brace limitation (feeds the
+`recovered_types` DB table used for cross-function prompt context — a
+separate mechanism from `output/writer.py`'s header generation, but the
+identical underlying bug). Fixed with the same brace-depth-matching approach
+(`_TYPE_START_RE` + `_matching_brace`, duplicated locally rather than
+sharing a module with `output/writer.py`, since the two packages have no
+existing import relationship and this is a small, self-contained helper).
+Verified against real data: pulled Chess.exe's actual `CRTStartup` function
+output from `semantic.db` and confirmed the fixed extraction now captures
+the complete 3,926-character class body — including a nested
+`static void startupRetryLoop()` method — ending at the class's true
+closing brace instead of truncating after the constructor's.
+
+---
+
+## What was built — session 15
+
+The most severe bug found this whole project: cross-binary data corruption
+via a global (non-per-binary) address uniqueness constraint. Surfaced when
+the user noticed the resumed-function count didn't match what they'd
+actually watched complete for `Chess.exe`.
+
+### The bug
+`functions.address` was `UNIQUE` on its own — globally, across every binary
+ever analyzed in `semantic.db`, not scoped per binary. Two different native
+PE binaries defaulting to the same load address (`0x140000000`, the norm
+for non-ASLR-relocated executables) can — and did — share a function
+address. `find.exe` and `Chess.exe` both have a function at `0x140001010`.
+When Chess.exe's run reached that address, `is_complete_for_provider`
+found `final_cpp` already populated and `provider='bonsai'` from
+`find.exe`'s testing many sessions earlier — both true — and silently
+skipped translating it, splicing `find.exe`'s old `InitializeApplication`
+result into Chess.exe's output under Chess's own address, with zero
+warning. Confirmed directly: the row's `name` (Ghidra/DWARF-derived, so
+trustworthy) was Chess's real `pre_c_init`, but `ai_name`/`final_cpp` were
+find.exe's leftovers.
+
+### Fix — `analyzer/types_db.py`, `ai/translator.py`, `main.py`
+- Added a `binary` column to `functions`; changed the uniqueness constraint
+  from `address UNIQUE` to a table-level `UNIQUE(binary, address)`.
+- `_migrate_functions_columns` now special-cases this: a database missing
+  `binary` predates per-binary scoping and needs a full rebuild regardless
+  of whether `binary` itself could be cheaply `ALTER`ed in, since `ALTER
+  TABLE` can't change an existing UNIQUE constraint. `_rebuild_functions_table`
+  (session 11) already handled exactly this kind of migration.
+  Rebuilt rows from before `binary` existed get `binary=''` by default.
+  New rows always get a real name, so those legacy rows can't collide with
+  properly-scoped ones going forward.
+  Deliberately not fixed in the same pass: `call_graph`/`get_callee_summaries`/
+  `get_caller_summaries` still join on function *name*, not address — a
+  pre-existing, lower-severity cousin of this bug (already documented,
+  session 2's edge-case list) that pollutes cross-function *context* rather
+  than corrupting a stored final translation. Left alone to keep this fix
+  scoped to the confirmed, severe bug.
+- Every address-keyed method on `SemanticDB` now also takes `binary`:
+  `upsert_function`, `get_function`, `set_pass_output`, `set_final_cpp`,
+  `set_ai_name`, `get_ai_name`, `set_provider`, `clear_pass_data`,
+  `is_complete_for_provider`, `set_summary`, `get_summary`.
+- `MultiPassTranslator.__init__` now takes `binary_name` and stores it,
+  threading it through every DB call inside `translate()`.
+- `main.py` computes `binary_name = binary_path.stem` once (the same value
+  already used for `ProjectWriter`) and passes it to `upsert_function`,
+  `MultiPassTranslator`, `is_complete_for_provider`, and `get_function`.
+
+### Data decision
+Existing `semantic.db` rows were already ambiguously mixed between binaries
+wherever addresses collided — no reliable way to retroactively attribute a
+row to the binary it actually came from. Wiped it rather than attempting a
+migration of corrupted data (explicitly agreed with the user first).
+
+### Verification against the real bug and the migration path
+- Fresh DB, real repro: inserted `find`/`FUN_140001010` and
+  `Chess`/`pre_c_init` both at address `140001010` (the exact colliding
+  address). Confirmed they land as two separate rows, and — after marking
+  `find`'s row complete under `bonsai` — confirmed
+  `is_complete_for_provider('Chess', addr, 'bonsai')` correctly returns
+  `False` despite `find` sharing the same address and provider.
+- Migration path, real repro: built a synthetic old-schema DB (single-column
+  `UNIQUE(address)`, no `binary` column, one pre-existing row) in a scratch
+  copy, ran `init()` against it, confirmed the forced rebuild fired, the old
+  row survived with `binary=''`, and a different binary could then use the
+  identical address without any constraint violation.
+- Cleaned up a self-inflicted mess from the first verification pass: it had
+  targeted the real `DB_PATH`, not a scratch copy, leaving synthetic test
+  rows in the actual database. Caught by inspecting contents before
+  deleting, wiped properly afterward — the real `semantic.db` is gone,
+  ready to be created fresh and clean on the next real run.
+
+---
+
+## What was built — session 16
+
+Follow-up to session 15's severe fix: the same category of cross-binary
+collision, one step removed — `call_graph` and its two summary-lookup
+methods, flagged (but deliberately not fixed) at the time.
+
+### The bug
+`get_callee_summaries`/`get_caller_summaries` join `call_graph` against
+`functions` by function *name*, and `call_graph` itself had no `binary`
+column at all. Two different binaries sharing a common function name (e.g.
+`atexit` — near-guaranteed for anything linking the C runtime) could inject
+the wrong neighbour's one-line summary into a prompt as "here's what your
+caller/callee does." Lower severity than session 15's bug — it pollutes
+prompt *context*, not a function's own stored `final_cpp` — but the same
+underlying mistake.
+
+### Fix — `analyzer/types_db.py`, `ai/translator.py`, `main.py`
+- Added `binary` to `call_graph`, changed `UNIQUE(caller_addr, callee_name)`
+  to `UNIQUE(binary, caller_addr, callee_name)`.
+- New `_migrate_call_graph`, same shape as session 15's functions-table
+  migration: a table missing `binary` predates scoping and always needs a
+  rebuild (`ALTER TABLE` can't touch an existing UNIQUE constraint).
+- `add_call_edge`, `get_callee_summaries`, `get_caller_summaries` all take
+  `binary` now; the summary joins add `AND f.binary = cg.binary`.
+- Threaded `binary_name` through the one call site in `main.py`
+  (`add_call_edge`) and the two in `ai/translator.py`
+  (`get_callee_summaries`, `get_caller_summaries`).
+
+### Deliberately not fixed — a narrower, deeper case remains
+The join is still by name *within* a binary, and Ghidra only exports callee
+*names*, not addresses — so two functions sharing a name *within the same
+binary* still can't be told apart. This isn't hypothetical: Chess.exe
+itself has two functions both named `__do_global_ctors` at different
+addresses. Properly fixing that means capturing callee addresses in
+`ghidra_scripts/ExportAnalysis.java`'s export and threading that through
+`analyzer/parse_output.py` and the callee-guard logic in
+`ai/translator.py` (which also currently treats callees as bare name
+strings) — a materially bigger change than this session's fix, left for a
+future pass.
+
+### Verification against real reproductions, in scratch copies this time
+- Two binaries (`find`, `Chess`), each with its own `main` calling its own
+  `atexit`, each `atexit` given a distinct summary. Confirmed
+  `get_callee_summaries('find', ...)` and `get_callee_summaries('Chess',
+  ...)` each return only their own binary's summary, not the other's.
+- Migration: built a synthetic old-schema `call_graph` (no `binary` column,
+  one pre-existing edge), ran `init()`, confirmed the rebuild fired, the old
+  edge survived with `binary=''`, and a second binary could then reuse the
+  same `caller_addr`+`callee_name` pair without a constraint violation.
+- Learned from session 15's mistake: every test this time ran against an
+  explicit scratch-directory path, never `DB_PATH` — confirmed the real
+  `semantic.db` still doesn't exist afterward, untouched.
+
+---
+
 ## Known limitations / next steps
 
 ### Still to build
@@ -574,9 +859,19 @@ with no error or warning.
    Very large functions will be truncated. Future: summarise p-code by opcode
    frequency rather than raw truncation.
 
-4. **Call graph query** — `get_callee_summaries` joins on function name, not address.
-   If two functions share a name (unlikely but possible in stripped binaries), the
-   wrong summary could be injected. Future: join on address.
+4. **Call graph query joins on name, not address (partially fixed, session 16)**
+   — the *cross-binary* version of this (two different binaries sharing a
+   callee name, e.g. `atexit`) is fixed: `call_graph` is now binary-scoped.
+   Still open: the join is by name *within* a single binary too, and Ghidra
+   only exports callee *names*, not addresses, so two same-named functions
+   in the *same* binary still can't be told apart. Not hypothetical —
+   confirmed happening: Chess.exe has two functions both named
+   `__do_global_ctors` at different addresses. Fixing this properly means
+   capturing callee addresses in `ghidra_scripts/ExportAnalysis.java`'s
+   export and threading that through `analyzer/parse_output.py` and the
+   callee-guard logic in `ai/translator.py` (which also currently treats
+   callees as bare name strings) — a materially bigger change than a query
+   tweak, not yet done.
 
 5. **analyzeHeadless path** — `GHIDRA_PATH` in `config.py` is a machine-specific
    absolute path (currently a local dev path). Update it before running on

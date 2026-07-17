@@ -48,9 +48,20 @@ public class ExportAnalysis extends GhidraScript {
             try {
                 output.add(exportFunction(func));
                 total++;
-            } catch (Exception e) {
-                println("WARNING: skipping " + func.getName() + ": " + e.getMessage());
+            } catch (Throwable t) {
+                // Catch Throwable, not just Exception — a single pathological
+                // function (e.g. a huge decompiled output blowing the JVM
+                // heap) must not abort analysis of the whole binary.
+                // OutOfMemoryError extends Error, not Exception, so a plain
+                // `catch (Exception e)` here lets it propagate straight past
+                // this loop and abort the entire headless run instead of just
+                // skipping the one function that triggered it.
+                println("WARNING: skipping " + func.getName() + ": "
+                    + t.getClass().getSimpleName() + ": " + t.getMessage());
                 skipped++;
+                if (t instanceof OutOfMemoryError) {
+                    System.gc();  // best-effort: reclaim this function's partial decode state
+                }
             }
         }
 

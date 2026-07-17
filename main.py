@@ -122,6 +122,10 @@ def main():
     _check_env(args.provider)
 
     binary_path = Path(args.binary)
+    # Identifies this binary's rows in semantic.db — addresses alone aren't
+    # globally unique (two different binaries can share a load address, and
+    # commonly do for native PE executables), so every DB lookup needs both.
+    binary_name = binary_path.stem
 
     console.print(Panel(
         f"[bold]Binary:[/bold] {binary_path.name}\n"
@@ -200,9 +204,9 @@ def main():
     db.init()
 
     for fn in functions:
-        db.upsert_function(fn.address, fn.name, fn.signature)
+        db.upsert_function(binary_name, fn.address, fn.name, fn.signature)
         for callee in fn.callees:
-            db.add_call_edge(fn.address, callee)
+            db.add_call_edge(binary_name, fn.address, callee)
 
     db.seed_known_apis(KNOWN_APIS)
 
@@ -218,11 +222,12 @@ def main():
 
     translator = MultiPassTranslator(
         db=db,
+        binary_name=binary_name,
         num_passes=args.passes,
         provider=args.provider,
         ollama_model=args.ollama_model,
     )
-    writer = ProjectWriter(output_dir=args.output, binary_name=binary_path.stem)
+    writer = ProjectWriter(output_dir=args.output, binary_name=binary_name)
 
     # Throttle writer.write() instead of calling it after every function —
     # it fully re-serializes everything accumulated so far, so calling it
@@ -259,9 +264,9 @@ def main():
             # burning another 6-pass round trip. A result from a *different*
             # provider doesn't count; switching providers means you want
             # fresh output, not someone else's cached answer.
-            if db.is_complete_for_provider(fn.address, args.provider.lower()):
+            if db.is_complete_for_provider(binary_name, fn.address, args.provider.lower()):
                 progress.update(task, description=f"[dim]{fn.name[:30]} (cached)[/dim]")
-                cached = db.get_function(fn.address)
+                cached = db.get_function(binary_name, fn.address)
                 ai_name = cached.get("ai_name") or fn.name
                 writer.add_function(ai_name, fn.address, cached["final_cpp"], fn.signature)
                 _write_if_due()

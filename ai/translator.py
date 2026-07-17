@@ -105,10 +105,30 @@ def _dropped_callees(before: str, after: str, callees: list[str]) -> set[str]:
     return dropped
 
 
+_TYPE_START_RE = re.compile(
+    r'^(struct|class|enum(?:\s+class)?)\s+(\w+)\s*(?::[^{;]*)?\{',
+    re.MULTILINE
+)
+
+
+def _matching_brace(code: str, open_pos: int):
+    """Index of the `}` that closes the `{` at `open_pos`, or None if unbalanced."""
+    depth = 0
+    for i in range(open_pos, len(code)):
+        if code[i] == "{":
+            depth += 1
+        elif code[i] == "}":
+            depth -= 1
+            if depth == 0:
+                return i
+    return None
+
+
 class MultiPassTranslator:
-    def __init__(self, db: SemanticDB, num_passes: int = NUM_PASSES,
+    def __init__(self, db: SemanticDB, binary_name: str, num_passes: int = NUM_PASSES,
                  provider: str = LLM_PROVIDER, ollama_model: str = OLLAMA_MODEL):
         self.db = db
+        self.binary_name = binary_name
         self.num_passes = min(num_passes, NUM_PASSES)
         self.provider = provider.lower()
         self._llm = LLMClient(provider=provider, ollama_model=ollama_model)
@@ -132,7 +152,7 @@ class MultiPassTranslator:
         # completed some passes before being interrupted. A stored pass
         # belonging to a DIFFERENT (or no) provider must never be reused —
         # only compare before overwriting the provider marker below.
-        existing = self.db.get_function(address)
+        existing = self.db.get_function(self.binary_name, address)
         same_provider = bool(existing) and existing.get("provider") == self.provider
 
         # Switching providers (or a brand-new function): any stale results
@@ -143,11 +163,11 @@ class MultiPassTranslator:
         # complete result — which is_complete_for_provider would then wrongly
         # read as "already done" on a later resumed run.
         if not same_provider:
-            self.db.clear_pass_data(address)
+            self.db.clear_pass_data(self.binary_name, address)
 
         # Mark which provider is (re)producing this function's results, so a
         # resumed run can tell "already done" from "done by someone else"
-        self.db.set_provider(address, self.provider)
+        self.db.set_provider(self.binary_name, address, self.provider)
 
         ai_name = ""  # locked in after pass 2
         start_pass = 1
@@ -162,7 +182,7 @@ class MultiPassTranslator:
                 if pass_num == 2:
                     ai_name = extract_function_name(current_code, fallback="")
                     if ai_name and ai_name != name:
-                        self.db.set_ai_name(address, ai_name)  # idempotent if already persisted
+                        self.db.set_ai_name(self.binary_name, address, ai_name)  # idempotent if already persisted
                 if pass_num == 3:
                     self._harvest_types(current_code, address)  # idempotent
             if start_pass > 1:
@@ -171,8 +191,8 @@ class MultiPassTranslator:
 
         # Fetch shared context (types discovered so far, neighbour summaries)
         recovered_types = self.db.get_types_for_context()
-        callee_summaries = self.db.get_callee_summaries(address)
-        caller_summaries = self.db.get_caller_summaries(name)
+        callee_summaries = self.db.get_callee_summaries(self.binary_name, address)
+        caller_summaries = self.db.get_caller_summaries(self.binary_name, name)
         callees = function_data.get("callees", [])
 
         for pass_num in range(start_pass, self.num_passes + 1):
@@ -202,26 +222,26 @@ class MultiPassTranslator:
                     new_code = prev_code  # reject this pass, keep previous output
 
             current_code = new_code
-            self.db.set_pass_output(address, pass_num, current_code)
+            self.db.set_pass_output(self.binary_name, address, pass_num, current_code)
 
             # Fix 2 — name lock: after pass 2 (renaming), capture the AI's chosen
             # function name and store it so later passes can't silently revert it.
             if pass_num == 2:
                 ai_name = extract_function_name(current_code, fallback="")
                 if ai_name and ai_name != name:
-                    self.db.set_ai_name(address, ai_name)
+                    self.db.set_ai_name(self.binary_name, address, ai_name)
 
             # After pass 3, extract any new type definitions and store them
             if pass_num == 3:
                 self._harvest_types(current_code, address)
                 recovered_types = self.db.get_types_for_context()
 
-        self.db.set_final_cpp(address, current_code)
+        self.db.set_final_cpp(self.binary_name, address, current_code)
 
         # Generate a one-line summary for the call-graph context of other functions
         display_name = ai_name or name
         summary = self._summarise(display_name, current_code)
-        self.db.set_summary(address, summary)
+        self.db.set_summary(self.binary_name, address, summary)
 
         return current_code
 
@@ -230,16 +250,26 @@ class MultiPassTranslator:
     # ------------------------------------------------------------------
 
     def _harvest_types(self, code: str, source_addr: str):
-        """Extract struct/enum/class definitions from pass-3 output and store them."""
-        # Match top-level struct / class / enum blocks
-        pattern = re.compile(
-            r'^(struct|class|enum(?:\s+class)?)\s+(\w+)\s*(?::[^{]*)?\{[^}]*\}\s*;',
-            re.MULTILINE | re.DOTALL
-        )
-        for m in pattern.finditer(code):
+        """
+        Extract struct/enum/class definitions from pass-3 output and store
+        them. Uses real brace-depth matching rather than a single-level
+        regex (`\\{[^}]*\\}`) — a class with an inline method body has its
+        own nested braces, which the old regex would truncate at (the
+        method's closing brace, not the type's own), storing a broken
+        fragment as if it were the complete type. Same underlying bug as
+        the one found and fixed in output/writer.py's header generation.
+        """
+        for m in _TYPE_START_RE.finditer(code):
+            open_brace = m.end() - 1
+            close_brace = _matching_brace(code, open_brace)
+            if close_brace is None:
+                continue  # unbalanced in the source — skip rather than store a truncated fragment
+            tail = re.match(r'\s*;', code[close_brace + 1: close_brace + 21])
+            if not tail:
+                continue  # not actually followed by `;` — not a complete definition
             kind = m.group(1).split()[0]  # 'struct', 'class', 'enum'
             name = m.group(2)
-            definition = m.group(0)
+            definition = code[m.start():close_brace + 1 + tail.end()].strip()
             self.db.upsert_type(
                 name=name,
                 kind=kind,
