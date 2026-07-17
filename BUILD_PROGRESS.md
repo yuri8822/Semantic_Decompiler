@@ -18,7 +18,13 @@
 | `analyzer/types_db.py` | Done | 5-table semantic memory, WAL mode, context queries |
 | `ai/__init__.py` | Done | Package marker |
 | `ai/prompts.py` | Done | 6 pass-specific system prompts + context assembler |
-| `ai/translator.py` | Done | Multi-pass LLM pipeline (Anthropic/Xiaomi/Ollama), type harvesting, summaries |
+| `ai/llm_client.py` | Done | Thin facade — picks a provider from `ai/providers/` and forwards `complete()` |
+| `ai/providers/base.py` | Done | `BaseProvider` ABC — the one method (`complete`) every provider implements |
+| `ai/providers/anthropic_provider.py` | Done | Heavy/fast model split for passes 3/4 vs the rest |
+| `ai/providers/xiaomi_provider.py` | Done | Anthropic-compatible API, one model for all passes |
+| `ai/providers/ollama_provider.py` | Done | Local, OpenAI-compatible endpoint, one configured model |
+| `ai/providers/bonsai_provider.py` | Done | Local Bonsai 27B (1-bit) via llama.cpp's OpenAI-compatible server; strips a leading `<think>` block |
+| `ai/translator.py` | Done | Multi-pass LLM pipeline (provider-agnostic), type harvesting, summaries |
 | `output/__init__.py` | Done | Package marker |
 | `output/writer.py` | Done | Writes `recovered.h`, `recovered.cpp`, `function_index.txt` |
 | `ghidra_scripts/ExportAnalysis.java` | Done | Full export: CFG, strings, p-code SSA, callers/callees |
@@ -154,6 +160,39 @@ testing each pass in isolation.
 
 ---
 
+## What was built — session 4
+
+Split the single `ai/llm_client.py` if/elif ladder into one file per
+provider so each backend's quirks can be tuned in isolation, and added a
+fourth provider: Bonsai 27B (1-bit, local).
+
+### `ai/providers/`
+- `base.py` — `BaseProvider` ABC, one abstract method: `complete(system, user, pass_num) -> str`
+- `anthropic_provider.py`, `xiaomi_provider.py`, `ollama_provider.py` — straight
+  extractions of the logic that used to live in `llm_client.py`, behavior unchanged
+  (including the pass-3/4 heavy-model split for Anthropic, and the msg.content
+  block-type scan from session 3)
+- `bonsai_provider.py` — new. Talks to a local llama.cpp server (must be
+  [PrismML's fork](https://github.com/PrismML-Eng/llama.cpp) — vanilla llama.cpp
+  doesn't have the `Q1_0_g128` hybrid-attention kernels this quantization needs)
+  over its OpenAI-compatible `/v1/chat/completions` endpoint, same shape as the
+  Ollama provider. Strips a leading `<think>...</think>` block from the response,
+  since PrismML's docs say the 27B variant serves with "thinking" enabled by
+  default — **unverified against a live server**, see edge case below.
+- `__init__.py` — `_REGISTRY` dict + `get_provider(name, ollama_model=None)` factory
+
+### `ai/llm_client.py`
+- Reduced to a thin facade: `LLMClient.__init__` resolves a provider via
+  `get_provider()` and `complete()` just forwards to it. Public constructor
+  signature (`provider`, `ollama_model`) is unchanged, so `ai/translator.py`
+  and `main.py` needed no changes.
+
+### `config.py` / `main.py`
+- Added `BONSAI_BASE_URL`, `BONSAI_MODEL`, `BONSAI_MAX_TOKENS`; `LLM_PROVIDER`
+  and `--provider` now both accept `"bonsai"`.
+
+---
+
 ## Known limitations / next steps
 
 ### Still to build
@@ -192,3 +231,12 @@ testing each pass in isolation.
    still literally present in the code. Once pass 2 renames a callee's call
    site, that callee is unprotected for the rest of the pipeline. Future:
    track renamed callee names too, not just the original list.
+
+7. **Bonsai provider is untested against a live server** — `bonsai_provider.py`
+   assumes reasoning (if any) shows up as an inline `<think>...</think>` block
+   in `message.content` and strips it with a regex. Once the PrismML llama.cpp
+   fork is actually running Bonsai-27B-Q1_0.gguf, verify the raw response shape
+   — if reasoning instead arrives in a separate `reasoning_content` field, or
+   the model needs a `--reasoning-format` server flag, the stripping is a
+   harmless no-op but should be revisited. Also unverified: whether the
+   `model` field in the request needs to match anything the server expects.

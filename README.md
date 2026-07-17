@@ -33,6 +33,8 @@ Each pass feeds its output into the next. Context accumulates in a SQLite semant
   - [Anthropic](https://console.anthropic.com) — API key required
   - [Xiaomi MiMo](https://platform.xiaomimomo.com) — API key required
   - [Ollama](https://ollama.com) — local, no key needed
+  - [Bonsai 27B (1-bit)](https://huggingface.co/prism-ml/Bonsai-27B-gguf) — local, no key needed, but requires
+    building [PrismML's llama.cpp fork](https://github.com/PrismML-Eng/llama.cpp) and running it as a server
 
 ---
 
@@ -67,7 +69,7 @@ Edit [`config.py`](config.py) for your environment:
 # Path to Ghidra's headless analyzer
 GHIDRA_PATH = r"C:\path\to\ghidra\support\analyzeHeadless.bat"
 
-# Default provider: "anthropic", "xiaomi", or "ollama"
+# Default provider: "anthropic", "xiaomi", "ollama", or "bonsai"
 LLM_PROVIDER = "anthropic"
 
 # Anthropic models (heavy for passes 3-4, fast for the rest)
@@ -79,6 +81,10 @@ XIAOMI_MODEL = "mimo-v2.5-pro"
 
 # Ollama (local)
 OLLAMA_MODEL = "carstenuhlig/omnicoder-9b:q4_k_m"
+
+# Bonsai 27B, 1-bit (local, via a llama.cpp server)
+BONSAI_BASE_URL = "http://localhost:8080/v1"
+BONSAI_MODEL    = "Bonsai-27B-Q1_0"
 ```
 
 ---
@@ -93,7 +99,7 @@ python main.py <binary> [options]
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--provider` | `anthropic` | LLM provider: `anthropic`, `xiaomi`, `ollama` |
+| `--provider` | `anthropic` | LLM provider: `anthropic`, `xiaomi`, `ollama`, `bonsai` |
 | `--passes` | `6` | Number of AI passes (1–6) |
 | `--limit` | `0` (all) | Process only the first N functions |
 | `--output` | `output/recovered` | Output directory |
@@ -111,6 +117,9 @@ python main.py target.exe --provider xiaomi --passes 3 --limit 10
 
 # Local run with Ollama, reusing a prior Ghidra export
 python main.py target.exe --provider ollama --skip-ghidra
+
+# Local run with the Bonsai 27B (1-bit) llama.cpp server
+python main.py target.exe --provider bonsai --skip-ghidra
 
 # Analyze a Windows system binary
 python main.py "C:\Windows\System32\find.exe" --provider xiaomi --passes 3 --limit 5
@@ -156,6 +165,25 @@ ollama pull qwen2.5-coder:7b
 python main.py target.exe --provider ollama
 ```
 
+### Bonsai 27B, 1-bit (local)
+Free, fully offline, ~5 GB VRAM for a 27B model — every weight is 1 bit. Needs
+[PrismML's llama.cpp fork](https://github.com/PrismML-Eng/llama.cpp) (vanilla
+llama.cpp doesn't have the required `Q1_0_g128` kernels) and the
+[`Bonsai-27B-gguf`](https://huggingface.co/prism-ml/Bonsai-27B-gguf) weights
+(the true 1-bit repo — not `Ternary-Bonsai-27B-gguf`).
+
+```bash
+# one-time setup — clone and build (see the fork's README for build flags), then
+# download Bonsai-27B-Q1_0.gguf from prism-ml/Bonsai-27B-gguf
+git clone https://github.com/PrismML-Eng/llama.cpp
+cd llama.cpp && cmake -B build && cmake --build build --config Release
+
+./build/bin/llama-server -m Bonsai-27B-Q1_0.gguf --host 0.0.0.0 --port 8080 -ngl 99
+
+# in another terminal
+python main.py target.exe --provider bonsai
+```
+
 ---
 
 ## Architecture
@@ -174,8 +202,14 @@ analyzer/
 
 ai/
   translator.py             — Runs the multi-pass pipeline per function
-  llm_client.py             — Unified client for Anthropic / Xiaomi / Ollama
+  llm_client.py             — Thin facade that picks a provider and forwards complete()
   prompts.py                — Per-pass system prompts and user prompt builder
+  providers/
+    base.py                 — BaseProvider ABC (one method: complete)
+    anthropic_provider.py    — Claude, heavy/fast model split for passes 3-4
+    xiaomi_provider.py       — MiMo, Anthropic-compatible API
+    ollama_provider.py       — Local, OpenAI-compatible endpoint
+    bonsai_provider.py       — Local Bonsai 27B (1-bit), OpenAI-compatible endpoint
 
 output/
   writer.py                 — Writes recovered.h, recovered.cpp, function_index.txt

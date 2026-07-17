@@ -92,7 +92,7 @@ def main():
         help="Process only the first N functions (0 = all)"
     )
     parser.add_argument(
-        "--provider", default=LLM_PROVIDER, choices=["anthropic", "xiaomi", "ollama"],
+        "--provider", default=LLM_PROVIDER, choices=["anthropic", "xiaomi", "ollama", "bonsai"],
         help=f"LLM provider (default: {LLM_PROVIDER})"
     )
     parser.add_argument(

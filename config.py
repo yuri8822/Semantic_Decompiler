@@ -17,7 +17,7 @@ OUTPUT_DIR = PROJECT_ROOT / "output" / "recovered"
 DB_PATH = str(PROJECT_ROOT / "semantic.db")
 
 # --- AI provider ---
-# Set LLM_PROVIDER to "anthropic", "xiaomi", or "ollama"
+# Set LLM_PROVIDER to "anthropic", "xiaomi", "ollama", or "bonsai"
 LLM_PROVIDER = "anthropic"
 
 # Anthropic (cloud)
@@ -32,6 +32,14 @@ XIAOMI_MODEL    = "mimo-v2.5-pro"
 # Good code-focused models: qwen2.5-coder:7b, deepseek-coder-v2:16b, codellama:13b
 OLLAMA_BASE_URL = "http://localhost:11434/v1"
 OLLAMA_MODEL    = "carstenuhlig/omnicoder-9b:q4_k_m"
+
+# Bonsai 27B (1-bit, local) — llama.cpp server via PrismML's fork
+# https://github.com/PrismML-Eng/llama.cpp
+# https://huggingface.co/prism-ml/Bonsai-27B-gguf (Bonsai-27B-Q1_0.gguf)
+# Start the server first: ./build/bin/llama-server -m Bonsai-27B-Q1_0.gguf --host 0.0.0.0 --port 8080 -ngl 99
+BONSAI_BASE_URL   = "http://localhost:8080/v1"
+BONSAI_MODEL      = "Bonsai-27B-Q1_0"  # sent in the request; llama-server ignores it and serves whatever's loaded
+BONSAI_MAX_TOKENS = 4096
 
 MAX_TOKENS        = 8192  # Anthropic / Xiaomi
 OLLAMA_MAX_TOKENS = 4096  # local models typically cap at 4k
