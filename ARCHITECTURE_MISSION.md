@@ -1,5 +1,29 @@
 # Semantic Decompiler — Architecture Mission
 
+## Progress
+
+Scoped down and being executed as an 8-phase plan (excludes items #8/#9/#17
+and the recompile-equivalence part of #18 below — see rationale in the plan
+file). Tracked at `C:\Users\umar\.claude\plans\dynamic-dreaming-alpaca.md`;
+narrated per-phase in `BUILD_PROGRESS.md`.
+
+- **Phase 1 — done (BUILD_PROGRESS.md, session 21).** Knowledge-graph schema
+  (`entities`/`entity_facts`/`relationships`/`contradictions`) added to
+  `analyzer/types_db.py`, purely additive alongside the existing tables.
+  Ghidra export now also emits address-qualified callees (`calleeRefs`), so
+  `relationships` can resolve same-named functions within one binary
+  correctly. Verified against a real `analyzeHeadless` run, not just a
+  synthetic DB. Nothing downstream consumes the graph yet — that starts in
+  Phase 2+.
+- **Phases 2-8 — not started.** Deterministic evidence generation, evidence-
+  based whole-program prompting, a validation layer, confidence-gated
+  overwrite + contradiction detection, the iterative refinement loop,
+  semantic checkpoints/quality metrics, and `output/writer.py` catching up
+  to the graph. Sequenced risk-ascending; each phase requires a separate
+  go-ahead before starting.
+
+---
+
 ## Mission Statement
 
 Evolve the Semantic Decompiler from a function-by-function AI translation

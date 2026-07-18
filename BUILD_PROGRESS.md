@@ -1052,6 +1052,101 @@ clean 326-character function with no repetition at all.
 
 ---
 
+## What was built — session 21
+
+Start of a larger, explicitly-scoped architecture evolution
+(`ARCHITECTURE_MISSION.md`, plan approved and tracked at
+`C:\Users\umar\.claude\plans\dynamic-dreaming-alpaca.md`): moving the
+pipeline from flat per-function tables toward a whole-program
+entity/confidence/evidence knowledge graph, in 8 phases. Explicitly out of
+scope for the whole effort: a semantic IR with method/vector-level ops,
+symbolic execution/angr integration, and AST-diff/recompile-verify
+equivalence — all three are open-ended research bets rather than scoped
+engineering. This session is **Phase 1 only**: the graph schema and its one
+hard prerequisite (address-qualified callees). Nothing downstream consumes
+any of it yet — deliberately, so the existing linear 6-pass pipeline's
+behavior is provably unchanged before anything riskier gets built on top.
+
+### `analyzer/types_db.py`
+Four new tables, purely additive alongside the existing ones (no migration,
+no wipe — `recovered_types`/`variable_names`/`call_graph`/`functions` are
+untouched):
+- `entities` — one row per `(binary, kind, key)`, e.g. `(binary, "function", address)`.
+- `entity_facts` — append-only fact log per entity (name, type, field, ...).
+  A partial unique index (`WHERE is_current = 1`) keeps exactly one current
+  row per `(entity_id, fact_type)`; superseded facts are marked
+  `is_current = 0`, never deleted, so nothing is silently lost. Confidence
+  gating on the overwrite itself (not just last-write-wins) is deferred to
+  a later phase — `record_fact`/`record_facts_batch` just supersede-and-insert
+  for now.
+- `relationships` — same current/history shape, for edges (`calls` is the
+  only `rel_type` populated so far).
+- `contradictions` — logging table, not yet written to by any detection
+  logic (that's a later phase too — this session only adds the table + a
+  `record_contradiction` method for it to call into).
+- `known_apis` gained a nullable `library` column (cheap `ALTER TABLE`, no
+  rebuild needed) for a future library/STL signature detector to use.
+- New methods: `create_entity`, `get_entity_id`, `record_fact`,
+  `record_facts_batch` (one transaction for N facts — avoids the
+  per-call-connection cost of writing 5-20 facts individually),
+  `get_current_fact`, `get_entity_facts`, `add_relationship`,
+  `get_relationships`, `record_contradiction`.
+
+### `ghidra_scripts/ExportAnalysis.java` + `analyzer/parse_output.py`
+The one real prerequisite the plan flagged: `relationships` needs to point
+at a real entity, and Ghidra's existing `callees` export is names only —
+useless for telling apart two same-named functions in one binary (the
+already-documented `Chess.exe` `__do_global_ctors` case). Added a parallel
+`calleeRefs` array (`{name, address}` pairs) to the JSON export, and a new
+`FunctionData.callee_refs` field in `parse_output.py` (defaults to `[]`,
+so older JSON exports without the field still parse fine).
+
+### `main.py`
+The DB-seed step now also creates a `function` entity per function and
+records an address-resolved `calls` relationship for every callee that
+matches one of the binary's own exported functions — external/thunk callees
+(Ghidra addresses those as `EXTERNAL:00000006`-style pseudo-addresses) are
+correctly skipped rather than mismatched. The existing name-based
+`call_graph` table and `add_call_edge` call are untouched, since
+`get_callee_summaries`/`get_caller_summaries` (used in prompts today) still
+read from it — this session only adds the graph as new side data, it
+doesn't yet switch anything over to reading from it.
+
+### Verification — real Ghidra run, not just a synthetic DB
+- Ran a genuine `analyzeHeadless` invocation against
+  `C:\Windows\System32\find.exe` (this project's own established quick test
+  binary, chosen specifically so it wouldn't touch the `Chess.exe`
+  project/export). Exported 27 functions cleanly; confirmed `calleeRefs` is
+  present on every entry with correct `{name, address}` shape, including the
+  real external-address form (`EXTERNAL:00000006`) for CRT imports like
+  `__setusermatherr`.
+- Fed that real export through the actual `load_analysis()` →
+  entity-creation → relationship-creation code path (not reimplemented
+  separately) against a scratch DB: 27 entities created, 19 internal `calls`
+  relationships recorded, and confirmed the 2 external callees on
+  `FUN_140001010` were correctly excluded from relationships while its 2
+  internal callees got real address-resolved edges.
+- Separately exercised every new `SemanticDB` method (idempotent entity
+  creation, fact overwrite-preserves-history via `get_entity_facts(current_only=False)`,
+  batch inserts, relationship supersede-not-duplicate-on-re-add, contradiction
+  logging, a clean no-op `init()` re-run) against a scratch database, and
+  confirmed existing `functions`/`call_graph`/`known_apis` behavior is
+  unchanged.
+- Could not compile/lint `ExportAnalysis.java` outside Ghidra's own
+  classpath — verified instead by actually running it through
+  `analyzeHeadless`, which is a stronger check than a syntax read anyway.
+
+### Remaining phases (not started)
+Deterministic evidence generation (real dominator/loop analysis, bounded
+constant propagation, library/STL signature detection), evidence-based
+whole-program prompting, a generalized validation layer, confidence-gated
+overwrite + contradiction detection, the iterative refinement loop
+(replacing the strict linear 1-6 pass order), semantic checkpoints/quality
+metrics, and `output/writer.py` catching up to the graph. Sequenced
+deliberately risk-ascending — see the plan file for the full reasoning.
+
+---
+
 ## Known limitations / next steps
 
 ### Still to build
@@ -1077,19 +1172,21 @@ clean 326-character function with no repetition at all.
    Very large functions will be truncated. Future: summarise p-code by opcode
    frequency rather than raw truncation.
 
-4. **Call graph query joins on name, not address (partially fixed, session 16)**
+4. **Call graph query joins on name, not address (partially fixed, sessions 16 and 21)**
    — the *cross-binary* version of this (two different binaries sharing a
    callee name, e.g. `atexit`) is fixed: `call_graph` is now binary-scoped.
-   Still open: the join is by name *within* a single binary too, and Ghidra
-   only exports callee *names*, not addresses, so two same-named functions
-   in the *same* binary still can't be told apart. Not hypothetical —
-   confirmed happening: Chess.exe has two functions both named
-   `__do_global_ctors` at different addresses. Fixing this properly means
-   capturing callee addresses in `ghidra_scripts/ExportAnalysis.java`'s
-   export and threading that through `analyzer/parse_output.py` and the
-   callee-guard logic in `ai/translator.py` (which also currently treats
-   callees as bare name strings) — a materially bigger change than a query
-   tweak, not yet done.
+   Session 21 fixed the *same-binary* version too, but only for the new
+   knowledge-graph `relationships` table: Ghidra's export now also emits
+   address-qualified `calleeRefs`, and `main.py` uses them to record `calls`
+   relationships against the correct entity even when two functions share a
+   name (verified against the real, previously-cited case: Chess.exe's two
+   `__do_global_ctors`). **Still open:** the *existing* `call_graph` table
+   and `get_callee_summaries`/`get_caller_summaries` (what actually feeds
+   prompts today) are untouched and still join by name — this gap is only
+   closed for the graph's own data so far, not for what the AI passes
+   currently see. The callee-guard logic in `ai/translator.py` also still
+   treats callees as bare name strings. Fully closing this for prompt
+   context is a later phase of the architecture-mission plan (see session 21).
 
 5. **analyzeHeadless path** — `GHIDRA_PATH` in `config.py` is a machine-specific
    absolute path (currently a local dev path). Update it before running on
