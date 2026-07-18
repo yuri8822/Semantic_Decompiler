@@ -126,11 +126,13 @@ def _matching_brace(code: str, open_pos: int):
 
 class MultiPassTranslator:
     def __init__(self, db: SemanticDB, binary_name: str, num_passes: int = NUM_PASSES,
-                 provider: str = LLM_PROVIDER, ollama_model: str = OLLAMA_MODEL):
+                 provider: str = LLM_PROVIDER, ollama_model: str = OLLAMA_MODEL,
+                 restart: bool = False):
         self.db = db
         self.binary_name = binary_name
         self.num_passes = min(num_passes, NUM_PASSES)
         self.provider = provider.lower()
+        self.restart = restart
         self._llm = LLMClient(provider=provider, ollama_model=ollama_model)
 
     def translate(
@@ -152,8 +154,12 @@ class MultiPassTranslator:
         # completed some passes before being interrupted. A stored pass
         # belonging to a DIFFERENT (or no) provider must never be reused —
         # only compare before overwriting the provider marker below.
+        # `--restart` forces same_provider False regardless of what's stored,
+        # so this function always starts clean from pass 1.
         existing = self.db.get_function(self.binary_name, address)
-        same_provider = bool(existing) and existing.get("provider") == self.provider
+        same_provider = (
+            bool(existing) and existing.get("provider") == self.provider and not self.restart
+        )
 
         # Switching providers (or a brand-new function): any stale results
         # from a different provider must be cleared BEFORE marking the new

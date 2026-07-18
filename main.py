@@ -9,6 +9,9 @@ Usage:
                     (an existing export is now reused automatically anyway —
                     this remains for explicitness / backwards compatibility)
     --force-ghidra  Re-run Ghidra even if an export already exists
+    --restart       Full fresh run: ignore all resume/cache state for this
+                     binary — re-runs Ghidra and reprocesses every function
+                     from pass 1, even ones already completed by this provider
     --passes N      Number of AI refinement passes (1-6, default 6)
     --output DIR    Output directory (default: output/recovered)
     --limit N       Process only the first N functions (0 = all)
@@ -92,6 +95,12 @@ def main():
         help="Re-run Ghidra even if an export for this binary already exists"
     )
     parser.add_argument(
+        "--restart", action="store_true",
+        help="Full fresh run: ignore all resume/cache state for this binary — "
+             "re-runs Ghidra and reprocesses every function from pass 1, even "
+             "ones already completed by this provider"
+    )
+    parser.add_argument(
         "--passes", type=int, default=NUM_PASSES,
         metavar=f"1-{NUM_PASSES}",
         help=f"Number of AI refinement passes (default: {NUM_PASSES})"
@@ -152,7 +161,7 @@ def main():
         and binary_path.stat().st_mtime > Path(json_path).stat().st_mtime
     )
 
-    if args.force_ghidra or (not args.skip_ghidra and (not export_exists or export_stale)):
+    if args.force_ghidra or args.restart or (not args.skip_ghidra and (not export_exists or export_stale)):
         console.print("\n[bold][1/4][/bold] Running Ghidra headless analysis...")
         try:
             json_path = analyze_binary(str(binary_path), verbose=args.verbose)
@@ -226,6 +235,7 @@ def main():
         num_passes=args.passes,
         provider=args.provider,
         ollama_model=args.ollama_model,
+        restart=args.restart,
     )
     writer = ProjectWriter(output_dir=args.output, binary_name=binary_name)
 
@@ -264,7 +274,7 @@ def main():
             # burning another 6-pass round trip. A result from a *different*
             # provider doesn't count; switching providers means you want
             # fresh output, not someone else's cached answer.
-            if db.is_complete_for_provider(binary_name, fn.address, args.provider.lower()):
+            if not args.restart and db.is_complete_for_provider(binary_name, fn.address, args.provider.lower()):
                 progress.update(task, description=f"[dim]{fn.name[:30]} (cached)[/dim]")
                 cached = db.get_function(binary_name, fn.address)
                 ai_name = cached.get("ai_name") or fn.name
