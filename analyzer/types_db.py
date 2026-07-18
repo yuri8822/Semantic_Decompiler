@@ -301,6 +301,11 @@ class SemanticDB:
         fn = self.get_function(binary, address)
         return fn.get("summary", "") if fn else ""
 
+    def get_all_functions(self) -> list[dict]:
+        with self._conn() as conn:
+            rows = conn.execute("SELECT * FROM functions ORDER BY binary, address").fetchall()
+        return [dict(r) for r in rows]
+
     # ------------------------------------------------------------------
     # Recovered types
     # ------------------------------------------------------------------
@@ -356,6 +361,13 @@ class SemanticDB:
             """, (function_addr,)).fetchall()
         return {r["original_name"]: r["inferred_name"] for r in rows}
 
+    def get_all_variable_names(self) -> list[dict]:
+        with self._conn() as conn:
+            rows = conn.execute("""
+                SELECT * FROM variable_names ORDER BY function_addr, original_name
+            """).fetchall()
+        return [dict(r) for r in rows]
+
     # ------------------------------------------------------------------
     # Known APIs
     # ------------------------------------------------------------------
@@ -408,6 +420,13 @@ class SemanticDB:
     # ghidra_scripts/ExportAnalysis.java's export and threading that through
     # parse_output.py and the callee-guard logic in ai/translator.py too —
     # a materially bigger change than this fix, left for a future pass.
+
+    def get_all_call_graph(self) -> list[dict]:
+        with self._conn() as conn:
+            rows = conn.execute("""
+                SELECT * FROM call_graph ORDER BY binary, caller_addr, callee_name
+            """).fetchall()
+        return [dict(r) for r in rows]
 
     def add_call_edge(self, binary: str, caller_addr: str, callee_name: str):
         with self._conn() as conn:
