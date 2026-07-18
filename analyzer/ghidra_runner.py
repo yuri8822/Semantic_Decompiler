@@ -6,6 +6,7 @@ to the JSON export produced by ExportAnalysis.java.
 import re
 import subprocess
 from pathlib import Path
+from typing import Callable, Optional
 
 from config import (
     GHIDRA_PATH,
@@ -17,7 +18,10 @@ from config import (
 )
 
 
-def analyze_binary(binary_path: str, overwrite: bool = True, verbose: bool = False) -> str:
+def analyze_binary(
+    binary_path: str, overwrite: bool = True, verbose: bool = False,
+    on_line: Optional[Callable[[str], None]] = None,
+) -> str:
     binary = Path(binary_path).resolve()
     if not binary.exists():
         raise FileNotFoundError(f"Binary not found: {binary}")
@@ -62,6 +66,8 @@ def analyze_binary(binary_path: str, overwrite: bool = True, verbose: bool = Fal
         output_lines.append(line)
         if verbose:
             print(line, end="")
+        if on_line:
+            on_line(line)
     process.wait()
     captured = "".join(output_lines)
 

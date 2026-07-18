@@ -4,3 +4,4 @@ networkx
 pydantic
 rich
 sqlite-utils
+textual

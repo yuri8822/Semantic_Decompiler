@@ -19,11 +19,7 @@ Usage:
 """
 
 import argparse
-import os
-import re
 import sys
-import time
-from pathlib import Path
 
 try:
     from dotenv import load_dotenv
@@ -42,40 +38,86 @@ from rich.progress import (
     TimeElapsedColumn,
 )
 
-from config import (
-    DB_PATH, GHIDRA_JSON_DIR, NUM_PASSES, OUTPUT_DIR, LLM_PROVIDER, OLLAMA_MODEL,
-    OUTPUT_WRITE_EVERY_N_FUNCTIONS, OUTPUT_WRITE_EVERY_SECONDS,
+from config import NUM_PASSES, OUTPUT_DIR, LLM_PROVIDER, OLLAMA_MODEL
+from pipeline import (
+    PipelineOptions, run_pipeline, check_env,
+    StageEvent, LogLine, ProgressEvent, DoneEvent, ErrorEvent,
 )
-from analyzer.ghidra_runner import analyze_binary
-from analyzer.parse_output import load_analysis
-from analyzer.ir_builder import build_ir
-from analyzer.cfg_builder import build_cfg_summary
-from analyzer.types_db import SemanticDB
-from analyzer.known_apis import KNOWN_APIS
-from ai.translator import MultiPassTranslator, extract_function_name
-from output.writer import ProjectWriter
 
 console = Console()
 
+_STAGE_NUM = {"ghidra": 1, "load": 2, "db": 3, "translate": 4}
 
-def _check_env(provider: str):
-    checks = {
-        "anthropic": ("ANTHROPIC_API_KEY", "sk-ant-..."),
-        "xiaomi":    ("XIAOMI_API_KEY",     "sk-s..."),
-    }
-    if provider in checks:
-        var, example = checks[provider]
-        if not os.environ.get(var):
-            console.print(
-                f"[bold red]ERROR:[/bold red] {var} is not set.\n"
-                f"Add it to your .env file:  {var}={example}"
+
+class _CLIReporter:
+    """Recreates the CLI's console output from the pipeline's event stream."""
+
+    def __init__(self, console: Console, verbose: bool = False):
+        self.console = console
+        self.verbose = verbose
+        self._last_stage = None
+        self._progress = None
+        self._task = None
+
+    def __call__(self, event) -> None:
+        if isinstance(event, StageEvent):
+            self._handle_stage(event)
+        elif isinstance(event, LogLine):
+            if self.verbose:
+                print(event.text)
+        elif isinstance(event, ProgressEvent):
+            self._handle_progress(event)
+        elif isinstance(event, DoneEvent):
+            self._handle_done(event)
+        elif isinstance(event, ErrorEvent):
+            self._stop_progress()
+            self.console.print(f"[bold red]Error:[/bold red] {event.message}")
+
+    def _handle_stage(self, event: StageEvent) -> None:
+        if event.level == "warn":
+            self.console.print(f"[bold yellow]Warning:[/bold yellow] {event.message}")
+            return
+        is_new_stage = event.stage != self._last_stage
+        self._last_stage = event.stage
+        if is_new_stage:
+            num = _STAGE_NUM.get(event.stage, "?")
+            self.console.print(f"\n[bold][{num}/4][/bold] {event.message}")
+        else:
+            self.console.print(f"  [green]✓[/green] {event.message}")
+
+    def _handle_progress(self, event: ProgressEvent) -> None:
+        if self._progress is None:
+            self._progress = Progress(
+                SpinnerColumn(),
+                TextColumn("[progress.description]{task.description:<40}"),
+                BarColumn(),
+                MofNCompleteColumn(),
+                TimeElapsedColumn(),
+                console=self.console,
             )
-            sys.exit(1)
+            self._progress.start()
+            self._task = self._progress.add_task("Reconstructing...", total=event.total)
+        desc = (
+            f"[dim]{event.function_name[:30]} (cached)[/dim]" if event.cached
+            else f"[cyan]{event.function_name[:38]}[/cyan]"
+        )
+        self._progress.update(self._task, description=desc)
+        self._progress.advance(self._task)
 
+    def _stop_progress(self) -> None:
+        if self._progress is not None:
+            self._progress.stop()
+            self._progress = None
 
-def _resolve_json_path(binary_path: Path) -> str:
-    safe_name = re.sub(r"[^a-zA-Z0-9._-]", "_", binary_path.name)
-    return str(GHIDRA_JSON_DIR / (safe_name + ".json"))
+    def _handle_done(self, event: DoneEvent) -> None:
+        self._stop_progress()
+        if event.cancelled:
+            self.console.print(f"\n[bold yellow]Cancelled.[/bold yellow] Partial project written to: [bold]{event.output_path}[/bold]")
+        else:
+            self.console.print(f"\n[bold green]Done.[/bold green] Recovered project written to: [bold]{event.output_path}[/bold]")
+            self.console.print("  recovered.h   — type definitions + forward declarations")
+            self.console.print("  recovered.cpp — full function implementations")
+            self.console.print("  function_index.txt — address → name mapping")
 
 
 def main():
@@ -128,187 +170,40 @@ def main():
     )
     args = parser.parse_args()
 
-    _check_env(args.provider)
+    try:
+        check_env(args.provider)
+    except EnvironmentError as e:
+        console.print(f"[bold red]ERROR:[/bold red] {e}")
+        sys.exit(1)
 
-    binary_path = Path(args.binary)
-    # Identifies this binary's rows in semantic.db — addresses alone aren't
-    # globally unique (two different binaries can share a load address, and
-    # commonly do for native PE executables), so every DB lookup needs both.
-    binary_name = binary_path.stem
+    options = PipelineOptions(
+        binary_path=args.binary,
+        skip_ghidra=args.skip_ghidra,
+        force_ghidra=args.force_ghidra,
+        restart=args.restart,
+        num_passes=args.passes,
+        output_dir=args.output,
+        limit=args.limit,
+        provider=args.provider,
+        ollama_model=args.ollama_model,
+        verbose=args.verbose,
+    )
 
     console.print(Panel(
-        f"[bold]Binary:[/bold] {binary_path.name}\n"
+        f"[bold]Binary:[/bold] {args.binary}\n"
         f"[bold]Passes:[/bold] {args.passes}   "
         f"[bold]Output:[/bold] {args.output}",
         title="[bold cyan]AI Semantic Decompiler[/bold cyan]",
         expand=False,
     ))
 
-    # ----------------------------------------------------------------
-    # Step 1: Ghidra analysis
-    # ----------------------------------------------------------------
-    json_path = _resolve_json_path(binary_path)
-    export_exists = Path(json_path).exists()
-
-    # Staleness check: if the binary itself is newer than its export (e.g.
-    # it was recompiled since), auto-reuse would otherwise silently analyze
-    # stale data with zero indication anything changed. Only meaningful when
-    # the binary is actually on disk to compare against — reusing an export
-    # without the original binary present (a normal --skip-ghidra workflow)
-    # has nothing to compare, so it's left alone.
-    export_stale = (
-        export_exists and binary_path.exists()
-        and binary_path.stat().st_mtime > Path(json_path).stat().st_mtime
-    )
-
-    if args.force_ghidra or args.restart or (not args.skip_ghidra and (not export_exists or export_stale)):
-        console.print("\n[bold][1/4][/bold] Running Ghidra headless analysis...")
-        try:
-            json_path = analyze_binary(str(binary_path), verbose=args.verbose)
-        except FileNotFoundError as e:
-            console.print(f"[bold red]Error:[/bold red] {e}")
-            sys.exit(1)
-        except RuntimeError as e:
-            console.print(f"[bold red]Ghidra failed:[/bold red]\n{e}")
-            sys.exit(1)
-        console.print(f"  [green]✓[/green] Export written to {json_path}")
-    else:
-        # Resume support: reuse an existing export automatically — Ghidra
-        # analysis is the slowest, most re-runnable-for-no-reason step in
-        # the pipeline. --skip-ghidra remains valid for explicitness; a
-        # missing export still errors out the same way it always has.
-        if export_stale:
-            console.print(
-                f"[bold yellow]Warning:[/bold yellow] {binary_path.name} looks newer than its "
-                f"Ghidra export (skipping anyway since --skip-ghidra was explicit). "
-                f"Pass --force-ghidra for a fresh analysis if you've recompiled it."
-            )
-        reason = "requested via --skip-ghidra" if args.skip_ghidra else "existing export found"
-        console.print(f"\n[bold][1/4][/bold] [dim]Skipping Ghidra ({reason}) — using {json_path}[/dim]")
-        if not Path(json_path).exists():
-            console.print(f"[bold red]Error:[/bold red] JSON not found at {json_path}")
-            sys.exit(1)
-
-    # ----------------------------------------------------------------
-    # Step 2: Load + validate
-    # ----------------------------------------------------------------
-    console.print("\n[bold][2/4][/bold] Loading Ghidra export...")
+    reporter = _CLIReporter(console, verbose=args.verbose)
     try:
-        functions = load_analysis(json_path)
-    except Exception as e:
-        console.print(f"[bold red]Failed to load analysis:[/bold red] {e}")
+        run_pipeline(options, on_event=reporter)
+    except (FileNotFoundError, RuntimeError) as e:
+        reporter._stop_progress()
+        console.print(f"[bold red]Error:[/bold red] {e}")
         sys.exit(1)
-
-    if args.limit:
-        functions = functions[:args.limit]
-        console.print(f"  [dim](limited to first {args.limit} functions)[/dim]")
-
-    console.print(f"  [green]✓[/green] {len(functions)} functions loaded")
-
-    # ----------------------------------------------------------------
-    # Step 3: Seed the database
-    # ----------------------------------------------------------------
-    console.print("\n[bold][3/4][/bold] Initializing semantic database...")
-    db = SemanticDB(DB_PATH)
-    db.init()
-
-    for fn in functions:
-        db.upsert_function(binary_name, fn.address, fn.name, fn.signature)
-        for callee in fn.callees:
-            db.add_call_edge(binary_name, fn.address, callee)
-
-    db.seed_known_apis(KNOWN_APIS)
-
-    # address → name map for IR CALL annotation (lowercase hex, no 0x prefix)
-    addr_map = {fn.address.lower(): fn.name for fn in functions}
-
-    console.print(f"  [green]✓[/green] Database ready at {DB_PATH}")
-
-    # ----------------------------------------------------------------
-    # Step 4: Multi-pass AI reconstruction
-    # ----------------------------------------------------------------
-    console.print(f"\n[bold][4/4][/bold] AI reconstruction ({args.passes} passes per function)...\n")
-
-    translator = MultiPassTranslator(
-        db=db,
-        binary_name=binary_name,
-        num_passes=args.passes,
-        provider=args.provider,
-        ollama_model=args.ollama_model,
-        restart=args.restart,
-    )
-    writer = ProjectWriter(output_dir=args.output, binary_name=binary_name)
-
-    # Throttle writer.write() instead of calling it after every function —
-    # it fully re-serializes everything accumulated so far, so calling it
-    # unconditionally is O(n^2) over a large run. Writes at most every
-    # OUTPUT_WRITE_EVERY_N_FUNCTIONS functions or OUTPUT_WRITE_EVERY_SECONDS
-    # seconds, whichever comes first; the unconditional final write after
-    # the loop always catches whatever this misses.
-    since_last_write = 0
-    last_write_time = time.monotonic()
-
-    def _write_if_due():
-        nonlocal since_last_write, last_write_time
-        since_last_write += 1
-        due = (since_last_write >= OUTPUT_WRITE_EVERY_N_FUNCTIONS
-               or time.monotonic() - last_write_time >= OUTPUT_WRITE_EVERY_SECONDS)
-        if due:
-            writer.write()
-            since_last_write = 0
-            last_write_time = time.monotonic()
-
-    with Progress(
-        SpinnerColumn(),
-        TextColumn("[progress.description]{task.description:<40}"),
-        BarColumn(),
-        MofNCompleteColumn(),
-        TimeElapsedColumn(),
-        console=console,
-    ) as progress:
-        task = progress.add_task("Reconstructing...", total=len(functions))
-
-        for fn in functions:
-            # Resume support: a prior run may have already fully translated
-            # this function with this exact provider — reuse it instead of
-            # burning another 6-pass round trip. A result from a *different*
-            # provider doesn't count; switching providers means you want
-            # fresh output, not someone else's cached answer.
-            if not args.restart and db.is_complete_for_provider(binary_name, fn.address, args.provider.lower()):
-                progress.update(task, description=f"[dim]{fn.name[:30]} (cached)[/dim]")
-                cached = db.get_function(binary_name, fn.address)
-                ai_name = cached.get("ai_name") or fn.name
-                writer.add_function(ai_name, fn.address, cached["final_cpp"], fn.signature)
-                _write_if_due()
-                progress.advance(task)
-                continue
-
-            progress.update(task, description=f"[cyan]{fn.name[:38]}[/cyan]")
-
-            ir          = build_ir(fn, addr_map=addr_map)
-            cfg_summary = build_cfg_summary(fn)
-            api_context = db.get_api_context(fn.imports)
-
-            cpp = translator.translate(
-                function_data=fn.to_context_dict(),
-                ir=ir,
-                cfg_summary=cfg_summary,
-                api_context=api_context,
-            )
-
-            ai_name = extract_function_name(cpp, fn.name)
-            writer.add_function(ai_name, fn.address, cpp, fn.signature)
-            _write_if_due()
-            progress.advance(task)
-
-    # ----------------------------------------------------------------
-    # Write output
-    # ----------------------------------------------------------------
-    out_path = writer.write()
-    console.print(f"\n[bold green]Done.[/bold green] Recovered project written to: [bold]{out_path}[/bold]")
-    console.print(f"  recovered.h   — type definitions + forward declarations")
-    console.print(f"  recovered.cpp — full function implementations")
-    console.print(f"  function_index.txt — address → name mapping")
 
 
 if __name__ == "__main__":
