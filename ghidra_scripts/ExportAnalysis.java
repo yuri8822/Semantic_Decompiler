@@ -110,6 +110,13 @@ public class ExportAnalysis extends GhidraScript {
         obj.add("callees", namesToArray(func.getCalledFunctions(monitor)));
         obj.add("callers", namesToArray(func.getCallingFunctions(monitor)));
 
+        // Address-qualified callees — `callees` above is names only, which
+        // can't distinguish two functions sharing a name within one binary
+        // (e.g. Chess.exe has two functions both named __do_global_ctors at
+        // different addresses). The knowledge-graph relationships table
+        // needs a real target address to resolve to the correct entity.
+        obj.add("calleeRefs", calleeRefsToArray(func.getCalledFunctions(monitor)));
+
         // Imports called by this function (external / thunk targets)
         obj.add("imports", exportImports(func));
 
@@ -268,6 +275,17 @@ public class ExportAnalysis extends GhidraScript {
         JsonArray arr = new JsonArray();
         for (Function f : funcs) {
             arr.add(f.getName());
+        }
+        return arr;
+    }
+
+    private JsonArray calleeRefsToArray(Set<Function> funcs) {
+        JsonArray arr = new JsonArray();
+        for (Function f : funcs) {
+            JsonObject ref = new JsonObject();
+            ref.addProperty("name", f.getName());
+            ref.addProperty("address", f.getEntryPoint().toString());
+            arr.add(ref);
         }
         return arr;
     }

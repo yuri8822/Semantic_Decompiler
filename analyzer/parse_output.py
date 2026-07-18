@@ -14,6 +14,13 @@ class Parameter(BaseModel):
     type_name: str = Field(alias="type", default="")
 
 
+class CalleeRef(BaseModel):
+    """Address-qualified callee — distinguishes two same-named functions
+    within one binary, which the plain `callees` name list cannot."""
+    name: str
+    address: str
+
+
 class CFGBlock(BaseModel):
     address: str
     end: str = ""
@@ -40,6 +47,7 @@ class FunctionData(BaseModel):
     signature: str = ""
     parameters: list[Parameter] = []
     callees: list[str] = []
+    callee_refs: list[CalleeRef] = Field(alias="calleeRefs", default=[])
     callers: list[str] = []
     imports: list[str] = []
     decompiled: str = ""

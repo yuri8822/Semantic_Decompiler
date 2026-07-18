@@ -9,9 +9,30 @@ Schema overview
 functions        — per-function analysis state, one row per pass output
 recovered_types  — inferred structs / classes / enums / typedefs
 variable_names   — inferred names for compiler-generated variable IDs
-call_graph       — caller→callee edges (populated from Ghidra export)
+call_graph       — caller→callee edges (populated from Ghidra export, joined
+                   by callee *name* — kept as-is for the existing prompt
+                   context queries; see `relationships` below for the
+                   address-qualified version)
+known_apis       — curated CRT/Win32 (and, later, library-tagged) signatures
+
+entities         — whole-program knowledge graph nodes: functions, classes,
+                   globals, types, enums, variables. One row per
+                   (binary, kind, key).
+entity_facts     — append-only fact log per entity (name, type, field, ...).
+                   Exactly one row per (entity_id, fact_type) has
+                   is_current=1 at a time; older rows are kept as history,
+                   never deleted, so no fact is ever silently lost.
+relationships    — append-only edges between entities (calls, references,
+                   inherits_from, member_of, ...), same current/history
+                   shape as entity_facts. Unlike call_graph, edges point at
+                   a real entity id (resolved via callee *address*), so two
+                   same-named functions in one binary can't be confused.
+contradictions   — logged whenever a new fact materially disagrees with the
+                   current one for (entity_id, fact_type), whether or not
+                   the new fact actually won.
 """
 
+import json
 import sqlite3
 from contextlib import contextmanager
 from typing import Optional
@@ -100,9 +121,62 @@ class SemanticDB:
                 signature   TEXT    NOT NULL,
                 description TEXT    DEFAULT ''
             );
+
+            CREATE TABLE IF NOT EXISTS entities (
+                id      INTEGER PRIMARY KEY,
+                binary  TEXT    NOT NULL,
+                kind    TEXT    NOT NULL,  -- 'function'|'class'|'global'|'type'|'enum'|'variable'
+                key     TEXT    NOT NULL,  -- address for function; name for class/type/global;
+                                           -- "addr:orig_name" for variable
+                UNIQUE(binary, kind, key)
+            );
+
+            CREATE TABLE IF NOT EXISTS entity_facts (
+                id          INTEGER PRIMARY KEY,
+                entity_id   INTEGER NOT NULL REFERENCES entities(id),
+                fact_type   TEXT    NOT NULL,
+                value       TEXT    NOT NULL,
+                confidence  REAL    NOT NULL,
+                evidence    TEXT    NOT NULL DEFAULT '[]',  -- JSON array
+                source_pass INTEGER,
+                provider    TEXT    DEFAULT '',
+                is_current  INTEGER NOT NULL DEFAULT 1,
+                created_at  TEXT    DEFAULT (datetime('now'))
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS ux_facts_current
+                ON entity_facts(entity_id, fact_type) WHERE is_current = 1;
+            CREATE INDEX IF NOT EXISTS ix_facts_entity
+                ON entity_facts(entity_id, fact_type, is_current);
+
+            CREATE TABLE IF NOT EXISTS relationships (
+                id             INTEGER PRIMARY KEY,
+                binary         TEXT    NOT NULL,
+                src_entity_id  INTEGER NOT NULL REFERENCES entities(id),
+                dst_entity_id  INTEGER NOT NULL REFERENCES entities(id),
+                rel_type       TEXT    NOT NULL,
+                confidence     REAL    NOT NULL,
+                evidence       TEXT    NOT NULL DEFAULT '[]',
+                is_current     INTEGER NOT NULL DEFAULT 1,
+                created_at     TEXT    DEFAULT (datetime('now'))
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS ux_rel_current
+                ON relationships(src_entity_id, dst_entity_id, rel_type) WHERE is_current = 1;
+            CREATE INDEX IF NOT EXISTS ix_rel_dst
+                ON relationships(dst_entity_id, rel_type, is_current);
+
+            CREATE TABLE IF NOT EXISTS contradictions (
+                id          INTEGER PRIMARY KEY,
+                entity_id   INTEGER NOT NULL REFERENCES entities(id),
+                fact_type   TEXT    NOT NULL,
+                old_fact_id INTEGER,
+                new_fact_id INTEGER NOT NULL,
+                resolved    INTEGER NOT NULL DEFAULT 0,
+                created_at  TEXT    DEFAULT (datetime('now'))
+            );
             """)
             self._migrate_functions_columns(conn)
             self._migrate_call_graph(conn)
+            self._migrate_known_apis(conn)
 
     def _migrate_functions_columns(self, conn):
         """
@@ -205,6 +279,14 @@ class SemanticDB:
         """)
         conn.execute("DROP TABLE call_graph")
         conn.execute("ALTER TABLE call_graph_rebuild RENAME TO call_graph")
+
+    def _migrate_known_apis(self, conn):
+        """`library` is a brand-new, nullable, no-constraint column — the
+        cheap ALTER path always works for this one, no rebuild needed."""
+        existing = {row["name"] for row in conn.execute("PRAGMA table_info(known_apis)")}
+        if "library" in existing:
+            return
+        conn.execute("ALTER TABLE known_apis ADD COLUMN library TEXT DEFAULT ''")
 
     # ------------------------------------------------------------------
     # Functions table
@@ -439,6 +521,139 @@ class SemanticDB:
                   AND f.summary != ''
             """, (binary, function_name)).fetchall()
         return [dict(r) for r in rows]
+
+    # ------------------------------------------------------------------
+    # Knowledge graph: entities / facts / relationships / contradictions
+    # ------------------------------------------------------------------
+    #
+    # Phase 1 of the architecture-mission plan: pure additive side-data.
+    # Nothing in the existing pass pipeline reads or writes these tables
+    # yet — `record_fact` currently does a plain last-write-wins overwrite
+    # (superseding whatever was `is_current` before); the confidence-margin
+    # gate and contradiction logging on top of it land in a later phase.
+
+    def create_entity(self, binary: str, kind: str, key: str) -> int:
+        """Idempotently create (or fetch) an entity, returning its id."""
+        with self._conn() as conn:
+            conn.execute("""
+                INSERT OR IGNORE INTO entities (binary, kind, key) VALUES (?, ?, ?)
+            """, (binary, kind, key))
+            row = conn.execute("""
+                SELECT id FROM entities WHERE binary = ? AND kind = ? AND key = ?
+            """, (binary, kind, key)).fetchone()
+        return row["id"]
+
+    def get_entity_id(self, binary: str, kind: str, key: str) -> Optional[int]:
+        with self._conn() as conn:
+            row = conn.execute("""
+                SELECT id FROM entities WHERE binary = ? AND kind = ? AND key = ?
+            """, (binary, kind, key)).fetchone()
+        return row["id"] if row else None
+
+    def record_fact(self, entity_id: int, fact_type: str, value: str,
+                     confidence: float, evidence: Optional[list] = None,
+                     source_pass: Optional[int] = None, provider: str = "") -> int:
+        """
+        Append a new fact for (entity_id, fact_type), marking it current and
+        superseding whatever was current before (the old row is kept, not
+        deleted — it's still readable via get_entity_facts(current_only=False)).
+        """
+        with self._conn() as conn:
+            return self._insert_fact(conn, entity_id, fact_type, value,
+                                      confidence, evidence, source_pass, provider)
+
+    def record_facts_batch(self, facts: list[dict]) -> list[int]:
+        """
+        Record multiple facts in one connection/transaction instead of one
+        per fact — a single pass can easily emit 5-20 facts (one per field,
+        one per relationship), and record_fact's per-call connection would
+        make that N micro-transactions instead of one.
+        Each dict: entity_id, fact_type, value, confidence, and optionally
+        evidence (list), source_pass, provider.
+        """
+        ids = []
+        with self._conn() as conn:
+            for f in facts:
+                ids.append(self._insert_fact(
+                    conn, f["entity_id"], f["fact_type"], f["value"], f["confidence"],
+                    f.get("evidence"), f.get("source_pass"), f.get("provider", ""),
+                ))
+        return ids
+
+    def _insert_fact(self, conn, entity_id: int, fact_type: str, value: str,
+                      confidence: float, evidence: Optional[list],
+                      source_pass: Optional[int], provider: str) -> int:
+        conn.execute("""
+            UPDATE entity_facts SET is_current = 0
+            WHERE entity_id = ? AND fact_type = ? AND is_current = 1
+        """, (entity_id, fact_type))
+        cur = conn.execute("""
+            INSERT INTO entity_facts
+                (entity_id, fact_type, value, confidence, evidence, source_pass, provider, is_current)
+            VALUES (?, ?, ?, ?, ?, ?, ?, 1)
+        """, (entity_id, fact_type, value, confidence, json.dumps(evidence or []),
+              source_pass, provider))
+        return cur.lastrowid
+
+    def get_current_fact(self, entity_id: int, fact_type: str) -> Optional[dict]:
+        with self._conn() as conn:
+            row = conn.execute("""
+                SELECT * FROM entity_facts
+                WHERE entity_id = ? AND fact_type = ? AND is_current = 1
+            """, (entity_id, fact_type)).fetchone()
+        return dict(row) if row else None
+
+    def get_entity_facts(self, entity_id: int, current_only: bool = True) -> list[dict]:
+        q = "SELECT * FROM entity_facts WHERE entity_id = ?"
+        if current_only:
+            q += " AND is_current = 1"
+        with self._conn() as conn:
+            rows = conn.execute(q, (entity_id,)).fetchall()
+        return [dict(r) for r in rows]
+
+    def add_relationship(self, binary: str, src_entity_id: int, dst_entity_id: int,
+                          rel_type: str, confidence: float = 0.9,
+                          evidence: Optional[list] = None) -> int:
+        with self._conn() as conn:
+            conn.execute("""
+                UPDATE relationships SET is_current = 0
+                WHERE src_entity_id = ? AND dst_entity_id = ? AND rel_type = ? AND is_current = 1
+            """, (src_entity_id, dst_entity_id, rel_type))
+            cur = conn.execute("""
+                INSERT INTO relationships
+                    (binary, src_entity_id, dst_entity_id, rel_type, confidence, evidence, is_current)
+                VALUES (?, ?, ?, ?, ?, ?, 1)
+            """, (binary, src_entity_id, dst_entity_id, rel_type, confidence,
+                  json.dumps(evidence or [])))
+        return cur.lastrowid
+
+    def get_relationships(self, entity_id: int, direction: str = "out",
+                           rel_type: Optional[str] = None) -> list[dict]:
+        """direction: 'out' (entity_id is the source) or 'in' (entity_id is the destination)."""
+        col = "src_entity_id" if direction == "out" else "dst_entity_id"
+        q = f"SELECT * FROM relationships WHERE {col} = ? AND is_current = 1"
+        params: list = [entity_id]
+        if rel_type:
+            q += " AND rel_type = ?"
+            params.append(rel_type)
+        with self._conn() as conn:
+            rows = conn.execute(q, params).fetchall()
+        return [dict(r) for r in rows]
+
+    def record_contradiction(self, entity_id: int, fact_type: str,
+                              old_fact_id: Optional[int], new_fact_id: int) -> int:
+        """
+        Logged whenever a new fact materially disagrees with the current
+        one for (entity_id, fact_type) — regardless of whether the new fact
+        actually won the overwrite (that decision belongs to whatever calls
+        this, not to record_fact itself).
+        """
+        with self._conn() as conn:
+            cur = conn.execute("""
+                INSERT INTO contradictions (entity_id, fact_type, old_fact_id, new_fact_id)
+                VALUES (?, ?, ?, ?)
+            """, (entity_id, fact_type, old_fact_id, new_fact_id))
+        return cur.lastrowid
 
     # ------------------------------------------------------------------
     # Internal helpers

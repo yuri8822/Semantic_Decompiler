@@ -212,10 +212,27 @@ def main():
     db = SemanticDB(DB_PATH)
     db.init()
 
+    # First pass: upsert the function row and create a `function` entity per
+    # function — entities must exist before relationships can reference them.
+    entity_ids = {}
     for fn in functions:
         db.upsert_function(binary_name, fn.address, fn.name, fn.signature)
         for callee in fn.callees:
             db.add_call_edge(binary_name, fn.address, callee)
+        entity_ids[fn.address.lower()] = db.create_entity(binary_name, "function", fn.address)
+
+    # Second pass: address-qualified `calls` relationships. Only recorded
+    # when the callee resolves to one of this binary's own exported
+    # functions (not an external/import) — this is what distinguishes two
+    # same-named functions within one binary, which the name-only
+    # call_graph edges above cannot.
+    for fn in functions:
+        src_id = entity_ids[fn.address.lower()]
+        for ref in fn.callee_refs:
+            dst_id = entity_ids.get(ref.address.lower())
+            if dst_id is not None:
+                db.add_relationship(binary_name, src_id, dst_id, "calls",
+                                     confidence=0.9, evidence=["ghidra_call_graph"])
 
     db.seed_known_apis(KNOWN_APIS)
 
