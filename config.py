@@ -44,16 +44,6 @@ BONSAI_BASE_URL   = "http://localhost:8080/v1"
 BONSAI_MODEL      = "Bonsai-27B-Q1_0"  # sent in the request; llama-server ignores it and serves whatever's loaded
 BONSAI_MAX_TOKENS = 4096
 
-# Per-request reasoning budget (thinking_budget_tokens) — only honored by the
-# server when it was NOT started with its own --reasoning-budget flag (see
-# start_bonsai.bat, and server-common.cpp's reasoning-budget handling: the
-# server-side flag wins whenever set, the per-request field is the fallback).
-# Mirrors ANTHROPIC_MODEL_HEAVY/_FAST's pass 3/4 split: type inference and
-# class reconstruction benefit from more thinking than the more mechanical
-# cleanup/renaming/consistency/beautification passes.
-BONSAI_REASONING_BUDGET_HEAVY = 600  # passes 3, 4
-BONSAI_REASONING_BUDGET_FAST  = 200  # passes 1, 2, 5, 6
-
 MAX_TOKENS        = 8192  # Anthropic / Xiaomi
 OLLAMA_MAX_TOKENS = 4096  # local models typically cap at 4k
 AI_TIMEOUT_SECONDS = 120

@@ -969,6 +969,49 @@ which would have wastefully reprocessed the two functions that already
 completed cleanly. Next run (without `--restart`) reprocesses `pre_cpp_init`
 fresh with the fixed stripping logic and resumes from function 3 onward.
 
+### A second, different crash — and the decision to revert reasoning entirely
+The very next `--restart` run got to 27/101 functions (~49 minutes) before
+crashing again, this time on `_M_data` (address `140001570`) with the same
+empty-content `RuntimeError`, but a genuinely different cause: the server
+log showed the model simply stopped generating on its own after ~155
+tokens (`finish_reason="stop"`, well under its 200-token budget, no
+"budget exhausted, forcing end sequence" line at all) — a stochastic dud
+response, not a parsing gap. Added a bounded retry (`_EMPTY_RESPONSE_RETRIES
+= 2`) to `complete()` so a one-off empty response doesn't kill an
+unattended run.
+
+But scanning *all* 27 already-processed functions for suspiciously oversized
+pass outputs (a cheap `length(passN_output) > 3000` proxy) turned up
+**five** flagged functions, not just the two already found — including
+`_M_data` itself, whose pass 4 (14,510 chars) had **no `<think>` tag at all,
+opening or closing** — the model narrated its reasoning as plain,
+undelimited text, embedded a code block partway through, kept rambling
+afterward, and got cut off mid-sentence. Nothing built so far could catch
+that pattern, since there's no delimiter to hook onto.
+
+Three distinct failure patterns in under an hour of real testing, each
+needing its own reactive heuristic, with no evidence the next one would be
+any easier to catch, and zero measured translation-quality benefit from
+reasoning to justify the fragility — put this to the user directly (options:
+turn thinking back off / add explicit delimiter markers to the prompts /
+keep patching reactively). Decision: **turn thinking off again.**
+`ai/providers/bonsai/bonsai_provider.py` reverted to the original
+`extra_body={"chat_template_kwargs": {"enable_thinking": False}}`
+suppression (the same approach every prior successful run used); removed
+`BONSAI_REASONING_BUDGET_HEAVY`/`_FAST` from `config.py` and the
+`thinking_budget_tokens`/heavy-pass/retry machinery from the provider —
+all of it was purely in service of the now-abandoned reasoning-on
+experiment. `_strip_thinking`'s dangling-tag handling itself was dropped
+too (folded back into the simpler `_THINK_BLOCK.sub(...)` one-liner), since
+without reasoning enabled there's no expected source of stray tags to
+defend against.
+
+Since the pollution risk was confirmed across five functions (not just the
+two individually inspected), the recommended recovery is a full
+`--restart` rather than hand-cleaning each row — cheap at 27/101 functions
+in, and removes any doubt about which of the five were actually polluted
+versus legitimately large.
+
 ---
 
 ## Known limitations / next steps
@@ -1036,3 +1079,21 @@ fresh with the fixed stripping logic and resumes from function 3 onward.
    content ever comes back empty alongside a reasoning trace. The `model`
    field in the request does not need to match anything — confirmed the
    server ignores it and serves whatever's loaded regardless of the string sent.
+
+8. **Self-recursive "delegate to the real implementation" stubs** — confirmed
+   in a real Chess.exe Bonsai run's `recovered.cpp`: for thin std-library-ish
+   functions (`operator_new`, `string`'s constructors, `_M_local_data`,
+   `_Allocator`, `_M_dispose`, `operator>>`, `_M_create`, …), the AI
+   sometimes writes a body that calls *itself* under the exact same
+   name/signature while commenting that it's "delegating to the underlying
+   implementation" — e.g. `void _M_dispose(void) { _M_dispose(); return; }`.
+   That's genuine infinite recursion if the code were ever compiled and run,
+   not a stylistic rough edge — the model appears to hallucinate a distinct
+   external symbol with the same spelling as the local one it just defined.
+   Seen across several functions in the same file, so not a one-off. Not yet
+   root-caused or fixed — unrelated to the Bonsai reasoning-leak issues above
+   (this file also happened to contain a raw chain-of-thought dump from that
+   separate bug, but this self-recursion pattern showed up in functions
+   untouched by that leak too). Needs a closer look once a clean re-run
+   (reasoning off) is available to compare against — worth checking whether
+   it's Bonsai-specific or shows up with other providers too.
