@@ -1014,6 +1014,44 @@ versus legitimately large.
 
 ---
 
+## What was built — session 20
+
+First full, uninterrupted 101/101 run with the reverted (thinking-off)
+Bonsai provider (`python main.py TestBinaries\Chess.exe --provider bonsai
+--restart`, ~1h55m). No crashes. But reviewing the shipped `recovered.cpp`
+surfaced a real, distinct quality bug that thinking-off did NOT fix.
+
+### Repetition-loop pollution — separate bug from the reasoning leaks
+Scanning all 101 functions' `final_cpp` for a repeated-chunk pattern found
+**6 functions** where the model got stuck repeating the exact same few
+lines of code or comment prose verbatim, dozens of times, until it ran out
+of budget. Worst case: `_Alloc_hider` shipped a **16.8KB final body that is
+entirely a repeated block of meta-commentary** ("But wait, the decompiled
+code shows the function is a member function... Let's assume... We will
+define the class...") about how to name one function call — never cleaned
+up by any of the later passes. Critically, this happened with thinking
+already suppressed (`enable_thinking: False`) and involves no `<think>`
+tags at all — proof that turning reasoning off fixed the crash-causing
+failure modes from session 19 but did not fix this separate one.
+
+Root cause, confirmed by reading llama.cpp's own `server-task.cpp`:
+`repeat_penalty` defaults to `1.0` ("disabled" per the CLI help text
+itself), and nothing in this codebase was overriding it — so nothing
+discouraged the model from looping once it started. `repeat_penalty` /
+`repeat_last_n` are genuinely per-request overridable (same
+`json_value(data, ..., defaults...)` fallback pattern confirmed for
+`reasoning_budget` earlier, but these two aren't shadowed by any
+server-startup flag the way that one was).
+
+### Fix — `ai/providers/bonsai/bonsai_provider.py`
+Added `"repeat_penalty": 1.1, "repeat_last_n": 256` to the request's
+`extra_body`. Verified directly: resent the exact prompt that produced
+`_Alloc_hider`'s 16.8KB repetition loop (same locked name, same imported
+call, same decompiled input) through the fixed provider — got back a
+clean 326-character function with no repetition at all.
+
+---
+
 ## Known limitations / next steps
 
 ### Still to build

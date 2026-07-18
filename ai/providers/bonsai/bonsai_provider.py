@@ -39,6 +39,22 @@ The `<think>...</think>` regex below stays as a defense-in-depth no-op in
 case a future server/template config re-enables inline-tag reasoning
 despite the suppression, and the empty-content check stays as a backstop
 in case suppression itself ever fails to apply.
+
+Separately — confirmed on a real, complete 101-function Chess.exe run
+(2026-07-18, thinking already off): 6 of the shipped `final_cpp` outputs
+still show a clear repetition-loop pattern (the model repeating the exact
+same few lines of code or comment prose verbatim, dozens of times, until it
+runs out of budget). Worst case, `_Alloc_hider`, shipped a 16.8KB body that
+is *entirely* a repeated block of meta-commentary about how to name a call,
+never cleaned up by any later pass. This is unrelated to the reasoning
+suppression above — no `<think>` tags involved, and it happens with
+thinking off — it's a raw sampling-quality issue: reading llama.cpp's own
+server-task.cpp confirmed `repeat_penalty` defaults to `1.0` ("disabled")
+with no override from this codebase, so nothing was discouraging the model
+from looping. `repeat_penalty`/`repeat_last_n` are genuinely per-request
+overridable (unlike `reasoning_budget` earlier — confirmed via the same
+`json_value(data, ..., defaults...)` fallback pattern in server-task.cpp),
+so they're set here rather than requiring a server restart.
 """
 
 import re
@@ -61,7 +77,11 @@ class BonsaiProvider(BaseProvider):
         resp = self._client.chat.completions.create(
             model=BONSAI_MODEL,
             max_tokens=BONSAI_MAX_TOKENS,
-            extra_body={"chat_template_kwargs": {"enable_thinking": False}},
+            extra_body={
+                "chat_template_kwargs": {"enable_thinking": False},
+                "repeat_penalty": 1.1,
+                "repeat_last_n": 256,
+            },
             messages=[
                 {"role": "system", "content": system},
                 {"role": "user", "content": user},
