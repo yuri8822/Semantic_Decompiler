@@ -921,6 +921,54 @@ pass 1 (200-token budget) produced a 764-char reasoning trace, pass 3
 with a complete, non-empty `content`. Confirms the budget is both respected
 and scales per pass as intended.
 
+### Also added — `--restart` CLI flag
+`main.py` gained `--restart`: forces a full fresh run for a binary, ignoring
+all resume/cache state (re-runs Ghidra regardless of an existing export,
+skips the `is_complete_for_provider` cache-hit check for every function, and
+forces `MultiPassTranslator`'s pass-level resume to treat every function as
+starting clean from pass 1 — which also triggers the existing
+`clear_pass_data()` wipe before reprocessing). Verified against the actual
+code paths (`clear_pass_data`, `ProjectWriter`, the Ghidra-reuse condition,
+and the cache-skip branch) — no gaps found.
+
+---
+
+## What was built — session 19
+
+First real unattended-style run with reasoning actually turned on
+(`python main.py TestBinaries\Chess.exe --provider bonsai --restart`)
+crashed on the 3rd function (`pre_cpp_init`, address `140001150`) with
+Bonsai's empty-content `RuntimeError`. Root-caused against the real stored
+data rather than guessed at.
+
+### Root cause — a dangling `</think>` bypasses the strip regex
+Pass 1 completed normally (364 chars). Pass 2 (fast budget, 200 tokens)
+stored **13,308 characters** — the model had narrated its entire reasoning
+process as plain text (no opening `<think>` tag at all), ending in a bare
+`</think>` immediately before the real, renamed function. `_THINK_BLOCK`
+only matches a *complete* `<think>...</think>` pair, so it found nothing to
+strip and let the whole 13KB narration through as "pass 2's clean output."
+Pass 3 then received that bloated, noisy blob as its input code and failed
+to produce any content — a cascading failure, not a pass-3-specific bug.
+
+### Fix — `ai/providers/bonsai/bonsai_provider.py`
+New `_strip_thinking()` handles both cases: strips complete `<think>...
+</think>` pairs first, then — if a `</think>` remains with no matching
+opener — drops everything up to and including it, keeping only what
+follows. Verified directly against the real polluted `pass2_output` pulled
+from `semantic.db`: 13,308 raw chars → 402 clean chars, exactly the
+renamed function with none of the narration.
+
+### Recovery
+The stuck function's stale `pass2_output`/`pass3_output` were already
+written to `semantic.db` before the fix, so a plain resume would have
+reused the polluted pass 2 text and hit the same failure again. Cleared
+just that one function's pass data via `SemanticDB.clear_pass_data('Chess',
+'140001150')` — confirmed empty afterward — rather than a full `--restart`,
+which would have wastefully reprocessed the two functions that already
+completed cleanly. Next run (without `--restart`) reprocesses `pre_cpp_init`
+fresh with the fixed stripping logic and resumes from function 3 onward.
+
 ---
 
 ## Known limitations / next steps

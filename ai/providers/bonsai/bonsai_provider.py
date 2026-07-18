@@ -49,6 +49,16 @@ future server config re-enables inline-tag reasoning instead
 (`--reasoning-format deepseek-legacy` or `none`), and the empty-content
 check below stays as a backstop in case a pass's budget is ever set too low
 and reasoning eats the whole response again.
+
+Confirmed live on a real Chess.exe run (2026-07-18): a *dangling* closing
+tag showed up in `content` — the model's reasoning was narrated as plain
+text (no opening `<think>`) and ended with a bare `</think>` right before
+the real answer. The paired regex above doesn't match that (no opening tag
+to pair with), so it let the entire reasoning trace through as if it were
+the translated code — 13KB of narration got stored as pass 2's output for
+`pre_cpp_init`, which then poisoned pass 3's prompt and made *that* pass
+fail too. `_strip_thinking()` below handles both the paired and the
+dangling case.
 """
 
 import re
@@ -61,6 +71,16 @@ from ai.providers.base import BaseProvider
 
 _THINK_BLOCK = re.compile(r"<think>.*?</think>\s*", re.DOTALL)
 _HEAVY_PASSES = {3, 4}  # type inference, class reconstruction — same split as AnthropicProvider
+
+
+def _strip_thinking(text: str) -> str:
+    """Strip reasoning that leaked into `content` instead of `reasoning_content`."""
+    text = _THINK_BLOCK.sub("", text)  # complete <think>...</think> pairs
+    if "</think>" in text:
+        # A closing tag with no matching opener — everything before it is
+        # narrated reasoning, not the answer. Keep only what follows.
+        text = text.split("</think>", 1)[1]
+    return text.strip()
 
 
 class BonsaiProvider(BaseProvider):
@@ -83,14 +103,21 @@ class BonsaiProvider(BaseProvider):
             ],
         )
         msg = resp.choices[0].message
-        text = (msg.content or "").strip()
-        if not text and getattr(msg, "reasoning_content", None):
+        raw = (msg.content or "").strip()
+        cleaned = _strip_thinking(raw)
+        # Checked AFTER stripping, not before: a response can be non-empty
+        # raw (e.g. reasoning narrated straight into `content`, terminated
+        # by a dangling `</think>` with nothing meaningful after it) yet
+        # strip down to nothing. Checking `raw` alone would miss that and
+        # silently return "" as if it were real translated code — the exact
+        # failure this check exists to catch.
+        if not cleaned and (getattr(msg, "reasoning_content", None) or raw):
             raise RuntimeError(
-                "Bonsai returned only a reasoning trace and no content "
+                "Bonsai returned no usable content after stripping reasoning "
                 f"(finish_reason={resp.choices[0].finish_reason!r}). "
                 f"The reasoning trace (budget {budget}) likely ate the whole "
                 "max_tokens budget — make sure start_bonsai.bat is NOT passing "
                 "--reasoning-budget (it must stay unset for thinking_budget_tokens "
                 "to take effect), or raise BONSAI_MAX_TOKENS in config.py."
             )
-        return _THINK_BLOCK.sub("", text).strip()
+        return cleaned
