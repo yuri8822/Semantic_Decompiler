@@ -185,3 +185,26 @@ MemoryPane {
     height: 1fr;
     overflow: auto;
 }
+
+SettingsPane {
+    padding: 1 2;
+}
+
+.settings-section {
+    height: auto;
+    margin-bottom: 1;
+}
+
+.settings-input {
+    width: 1fr;
+}
+
+#settings_actions {
+    height: auto;
+    margin-bottom: 1;
+}
+
+#settings_status {
+    height: auto;
+    margin-bottom: 1;
+}

@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 
 # --- Ghidra ---
@@ -68,3 +69,48 @@ PASS_NAMES = [
     "consistency",       # Pass 5: cross-function naming alignment
     "beautification",    # Pass 6: final C++ polish
 ]
+
+# --- Settings overrides (TUI Settings screen) ---------------------------
+# The values above are this file's hardcoded defaults. settings.json (gitignored,
+# per-machine — same reason GHIDRA_PATH itself is per-machine) holds whatever
+# the Settings screen has saved and, if present, overrides the matching names
+# below. This file is only read here, once, at import time — every other
+# module's `from config import X` binds the post-override value, so a saved
+# change only takes effect on the next process start, not the current one.
+SETTINGS_PATH = PROJECT_ROOT / "settings.json"
+
+# Whitelist of names the Settings screen may persist — deliberately excludes
+# path/derived constants above (DB_PATH, GHIDRA_JSON_DIR, OUTPUT_DIR, etc.)
+# since those aren't independent settings, just plain scalars a user would
+# reasonably want to edit instead of hand-editing this file.
+SETTINGS_KEYS = (
+    "GHIDRA_PATH",
+    "LLM_PROVIDER",
+    "ANTHROPIC_MODEL_HEAVY", "ANTHROPIC_MODEL_FAST",
+    "XIAOMI_BASE_URL", "XIAOMI_MODEL",
+    "OLLAMA_BASE_URL", "OLLAMA_MODEL",
+    "BONSAI_BASE_URL", "BONSAI_MODEL", "BONSAI_MAX_TOKENS",
+    "MAX_TOKENS", "OLLAMA_MAX_TOKENS",
+    "AI_TIMEOUT_SECONDS", "DECOMPILER_TIMEOUT_SECONDS",
+    "NUM_PASSES",
+)
+
+# Snapshot of this file's hardcoded values, taken BEFORE overrides are
+# applied — lets the Settings screen's "Reset to Defaults" show the true
+# code defaults immediately, without needing to re-import this module.
+HARDCODED_DEFAULTS = {key: globals()[key] for key in SETTINGS_KEYS}
+
+
+def _load_settings_overrides() -> None:
+    if not SETTINGS_PATH.exists():
+        return
+    try:
+        overrides = json.loads(SETTINGS_PATH.read_text())
+    except (json.JSONDecodeError, OSError):
+        return
+    for key, value in overrides.items():
+        if key in SETTINGS_KEYS:
+            globals()[key] = value
+
+
+_load_settings_overrides()

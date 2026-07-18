@@ -1,6 +1,9 @@
 # ── Secrets ────────────────────────────────────────────────────────────────
 .env
 
+# ── Machine-specific settings (Settings screen overrides, e.g. GHIDRA_PATH) ─
+settings.json
+
 # ── Python ─────────────────────────────────────────────────────────────────
 __pycache__/
 *.py[cod]

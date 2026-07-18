@@ -9,6 +9,7 @@ from tui.widgets.hint_bar import HintBar
 from tui.widgets.memory_pane import MemoryPane
 from tui.widgets.results_pane import ResultsPane
 from tui.widgets.run_pane import RunPane
+from tui.widgets.settings_pane import SettingsPane
 
 _HINTS = {
     "run": [
@@ -28,6 +29,12 @@ _HINTS = {
         ("enter", "Select row / choose"),
         ("click header", "Sort"),
         ("tab", "Focus next"),
+        ("q", "Quit"),
+    ],
+    "settings": [
+        ("tab", "Focus next"),
+        ("shift+tab", "Focus previous"),
+        ("enter", "Save / Reset"),
         ("q", "Quit"),
     ],
 }
@@ -52,6 +59,8 @@ class DecompilerApp(App):
                 yield ResultsPane()
             with TabPane("Memory", id="memory"):
                 yield MemoryPane()
+            with TabPane("Settings", id="settings"):
+                yield SettingsPane()
         yield HintBar()
 
     def on_mount(self) -> None:
