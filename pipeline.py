@@ -17,13 +17,13 @@ from config import (
     DB_PATH, GHIDRA_JSON_DIR, NUM_PASSES, OUTPUT_DIR, LLM_PROVIDER, OLLAMA_MODEL,
     OUTPUT_WRITE_EVERY_N_FUNCTIONS, OUTPUT_WRITE_EVERY_SECONDS,
 )
-from analyzer.ghidra_runner import analyze_binary
+from analyzer.ghidra_runner import analyze_binary, GhidraCancelled
 from analyzer.parse_output import load_analysis
 from analyzer.ir_builder import build_ir
 from analyzer.cfg_builder import build_cfg_summary
 from analyzer.types_db import SemanticDB
 from analyzer.known_apis import KNOWN_APIS
-from ai.translator import MultiPassTranslator, extract_function_name
+from ai.translator import MultiPassTranslator, extract_function_name, TranslationCancelled
 from output.writer import ProjectWriter
 
 
@@ -104,10 +104,12 @@ def run_pipeline(
     Runs the full pipeline for a single binary. Raises FileNotFoundError,
     RuntimeError, or EnvironmentError on the same fatal conditions that used
     to sys.exit(1) in the old CLI-only main() — callers decide how to
-    present that. should_cancel() is checked once per function (between
-    functions, not between a function's 6 AI passes); on a true result the
-    writer is flushed and a DoneEvent(cancelled=True) is returned rather
-    than raising, since cancellation isn't an error.
+    present that. should_cancel() is threaded down to the finest grain each
+    stage supports: once between Ghidra output lines during analysis, once
+    per AI pass during translation, and once per function between them. On
+    a cancellation the writer (if it exists yet) is flushed and a
+    DoneEvent(cancelled=True) is returned rather than raising, since
+    cancellation isn't an error.
     """
     check_env(options.provider)
 
@@ -140,7 +142,12 @@ def run_pipeline(
             json_path = analyze_binary(
                 str(binary_path), verbose=options.verbose,
                 on_line=lambda line: on_event(LogLine(line.rstrip("\n"))),
+                should_cancel=should_cancel,
             )
+        except GhidraCancelled:
+            on_event(StageEvent("ghidra", "Cancelled during Ghidra analysis.", level="warn"))
+            on_event(DoneEvent(output_path="", cancelled=True))
+            return Path("")
         except RuntimeError as e:
             raise RuntimeError(f"Ghidra failed:\n{e}") from e
         on_event(StageEvent("ghidra", f"Export written to {json_path}"))
@@ -251,12 +258,18 @@ def run_pipeline(
         cfg_summary = build_cfg_summary(fn)
         api_context = db.get_api_context(fn.imports)
 
-        cpp = translator.translate(
-            function_data=fn.to_context_dict(),
-            ir=ir,
-            cfg_summary=cfg_summary,
-            api_context=api_context,
-        )
+        try:
+            cpp = translator.translate(
+                function_data=fn.to_context_dict(),
+                ir=ir,
+                cfg_summary=cfg_summary,
+                api_context=api_context,
+                should_cancel=should_cancel,
+            )
+        except TranslationCancelled:
+            writer.write()
+            on_event(DoneEvent(output_path=str(writer.out_root), cancelled=True))
+            return writer.out_root
 
         ai_name = extract_function_name(cpp, fn.name)
         writer.add_function(ai_name, fn.address, cpp, fn.signature)

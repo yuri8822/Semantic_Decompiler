@@ -7,11 +7,18 @@ everything at once.
 """
 
 import re
+from typing import Callable
 
 from config import NUM_PASSES, OLLAMA_MODEL, LLM_PROVIDER
 from ai.llm_client import LLMClient
 from ai.prompts import SYSTEMS, build_user_prompt
 from analyzer.types_db import SemanticDB
+
+
+class TranslationCancelled(Exception):
+    """Raised by MultiPassTranslator.translate() when should_cancel() fires
+    between AI passes — the caller decides how to present that (same as any
+    other cancellation), it isn't an error."""
 
 
 def _call_llm(client: LLMClient, system: str, user: str, pass_num: int) -> str:
@@ -141,6 +148,7 @@ class MultiPassTranslator:
         ir: str = "",
         cfg_summary: str = "",
         api_context: str = "",
+        should_cancel: Callable[[], bool] = lambda: False,
     ) -> str:
         address = function_data["address"]
         name = function_data["name"]
@@ -202,6 +210,9 @@ class MultiPassTranslator:
         callees = function_data.get("callees", [])
 
         for pass_num in range(start_pass, self.num_passes + 1):
+            if should_cancel():
+                raise TranslationCancelled()
+
             prev_code = current_code
 
             system = SYSTEMS[pass_num]

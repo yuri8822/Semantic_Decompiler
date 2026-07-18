@@ -112,7 +112,10 @@ class _CLIReporter:
     def _handle_done(self, event: DoneEvent) -> None:
         self._stop_progress()
         if event.cancelled:
-            self.console.print(f"\n[bold yellow]Cancelled.[/bold yellow] Partial project written to: [bold]{event.output_path}[/bold]")
+            if event.output_path:
+                self.console.print(f"\n[bold yellow]Cancelled.[/bold yellow] Partial project written to: [bold]{event.output_path}[/bold]")
+            else:
+                self.console.print("\n[bold yellow]Cancelled.[/bold yellow] Nothing written yet.")
         else:
             self.console.print(f"\n[bold green]Done.[/bold green] Recovered project written to: [bold]{event.output_path}[/bold]")
             self.console.print("  recovered.h   — type definitions + forward declarations")

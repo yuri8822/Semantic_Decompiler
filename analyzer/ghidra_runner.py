@@ -3,7 +3,9 @@ Drives Ghidra's headless analyzer against a binary and returns the path
 to the JSON export produced by ExportAnalysis.java.
 """
 
+import os
 import re
+import signal
 import subprocess
 from pathlib import Path
 from typing import Callable, Optional
@@ -18,9 +20,40 @@ from config import (
 )
 
 
+class GhidraCancelled(Exception):
+    """Raised by analyze_binary() when should_cancel() fires mid-analysis."""
+
+
+def _kill_process_tree(process: subprocess.Popen) -> None:
+    """
+    Terminate `process` and everything it spawned. GHIDRA_PATH is a .bat
+    file, so `process` here is actually the cmd.exe host Windows launches to
+    run it — the real analyzeHeadless JVM is a grandchild. process.terminate()
+    alone would kill cmd.exe and leave Ghidra running orphaned in the
+    background, silently chewing CPU/RAM after "cancel" appears to have
+    worked. taskkill /T walks the process tree by PID and kills all of it.
+    """
+    if os.name == "nt":
+        subprocess.run(
+            ["taskkill", "/F", "/T", "/PID", str(process.pid)],
+            capture_output=True,
+        )
+    else:
+        try:
+            os.killpg(os.getpgid(process.pid), signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+    try:
+        process.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait()
+
+
 def analyze_binary(
     binary_path: str, overwrite: bool = True, verbose: bool = False,
     on_line: Optional[Callable[[str], None]] = None,
+    should_cancel: Callable[[], bool] = lambda: False,
 ) -> str:
     binary = Path(binary_path).resolve()
     if not binary.exists():
@@ -61,14 +94,29 @@ def analyze_binary(
     process = subprocess.Popen(
         cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
         text=True, bufsize=1,
+        # Own process group/session, so _kill_process_tree can reliably
+        # find and kill the whole tree (cmd.exe -> java.exe) on cancel.
+        creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0,
+        start_new_session=(os.name != "nt"),
     )
+    cancelled = False
     for line in process.stdout:
+        if should_cancel():
+            cancelled = True
+            break
         output_lines.append(line)
         if verbose:
             print(line, end="")
         if on_line:
             on_line(line)
+
+    if cancelled:
+        _kill_process_tree(process)
+        process.stdout.close()
+        raise GhidraCancelled()
+
     process.wait()
+    process.stdout.close()
     captured = "".join(output_lines)
 
     if not verbose and process.returncode != 0:

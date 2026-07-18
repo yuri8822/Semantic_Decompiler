@@ -46,7 +46,7 @@ class RunPane(Vertical):
         if event.button.id == "start_btn":
             self._start_run()
         elif event.button.id == "stop_btn":
-            self.query_one("#log", RichLog).write("[yellow]Cancelling... (finishing current function)[/yellow]")
+            self.query_one("#log", RichLog).write("[yellow]Cancelling...[/yellow]")
             self.query_one("#stop_btn", Button).disabled = True
             self.app.workers.cancel_group(self, "pipeline")
 
@@ -104,7 +104,10 @@ class RunPane(Vertical):
             log.write(f"[{event.completed}/{event.total}] {event.function_name}{suffix}")
         elif isinstance(event, DoneEvent):
             if event.cancelled:
-                log.write(f"[bold yellow]Cancelled.[/bold yellow] Partial output: {event.output_path}")
+                if event.output_path:
+                    log.write(f"[bold yellow]Cancelled.[/bold yellow] Partial output: {event.output_path}")
+                else:
+                    log.write("[bold yellow]Cancelled.[/bold yellow] Nothing written yet.")
             else:
                 log.write(f"[bold green]Done.[/bold green] Output: {event.output_path}")
             self._set_running(False)
