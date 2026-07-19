@@ -10,9 +10,8 @@ Usage:
                     this remains for explicitness / backwards compatibility)
     --force-ghidra  Re-run Ghidra even if an export already exists
     --restart       Full fresh run: ignore all resume/cache state for this
-                     binary — re-runs Ghidra and reprocesses every function
-                     from pass 1, even ones already completed by this provider
-    --passes N      Number of AI refinement passes (1-6, default 6)
+                     binary — re-runs Ghidra and retranslates every function,
+                     even ones already completed by this provider
     --output DIR    Output directory (default: output/recovered)
     --limit N       Process only the first N functions (0 = all)
     --verbose       Show Ghidra output during analysis
@@ -43,7 +42,7 @@ from rich.progress import (
 )
 
 from config import (
-    DB_PATH, GHIDRA_JSON_DIR, NUM_PASSES, OUTPUT_DIR, LLM_PROVIDER, OLLAMA_MODEL,
+    DB_PATH, GHIDRA_JSON_DIR, OUTPUT_DIR, LLM_PROVIDER, OLLAMA_MODEL,
     OUTPUT_WRITE_EVERY_N_FUNCTIONS, OUTPUT_WRITE_EVERY_SECONDS,
 )
 from analyzer.ghidra_runner import analyze_binary
@@ -53,7 +52,7 @@ from analyzer.cfg_builder import build_cfg_summary, analyze_deterministic
 from analyzer.types_db import SemanticDB, compute_confidence
 from analyzer.known_apis import KNOWN_APIS
 from analyzer.library_signatures import detect_library_types, classify_known_apis
-from ai.translator import MultiPassTranslator, extract_function_name
+from ai.translator import FunctionTranslator, extract_function_name
 from output.writer import ProjectWriter
 
 console = Console()
@@ -98,13 +97,8 @@ def main():
     parser.add_argument(
         "--restart", action="store_true",
         help="Full fresh run: ignore all resume/cache state for this binary — "
-             "re-runs Ghidra and reprocesses every function from pass 1, even "
-             "ones already completed by this provider"
-    )
-    parser.add_argument(
-        "--passes", type=int, default=NUM_PASSES,
-        metavar=f"1-{NUM_PASSES}",
-        help=f"Number of AI refinement passes (default: {NUM_PASSES})"
+             "re-runs Ghidra and retranslates every function, even ones "
+             "already completed by this provider"
     )
     parser.add_argument(
         "--output", default=str(OUTPUT_DIR),
@@ -139,7 +133,6 @@ def main():
 
     console.print(Panel(
         f"[bold]Binary:[/bold] {binary_path.name}\n"
-        f"[bold]Passes:[/bold] {args.passes}   "
         f"[bold]Output:[/bold] {args.output}",
         title="[bold cyan]AI Semantic Decompiler[/bold cyan]",
         expand=False,
@@ -275,14 +268,13 @@ def main():
     console.print(f"  [green]✓[/green] Database ready at {DB_PATH}")
 
     # ----------------------------------------------------------------
-    # Step 4: Multi-pass AI reconstruction
+    # Step 4: AI reconstruction
     # ----------------------------------------------------------------
-    console.print(f"\n[bold][4/4][/bold] AI reconstruction ({args.passes} passes per function)...\n")
+    console.print("\n[bold][4/4][/bold] AI reconstruction (single pass per function)...\n")
 
-    translator = MultiPassTranslator(
+    translator = FunctionTranslator(
         db=db,
         binary_name=binary_name,
-        num_passes=args.passes,
         provider=args.provider,
         ollama_model=args.ollama_model,
         restart=args.restart,
@@ -321,9 +313,9 @@ def main():
         for fn in functions:
             # Resume support: a prior run may have already fully translated
             # this function with this exact provider — reuse it instead of
-            # burning another 6-pass round trip. A result from a *different*
-            # provider doesn't count; switching providers means you want
-            # fresh output, not someone else's cached answer.
+            # another LLM round trip. A result from a *different* provider
+            # doesn't count; switching providers means you want fresh
+            # output, not someone else's cached answer.
             if not args.restart and db.is_complete_for_provider(binary_name, fn.address, args.provider.lower()):
                 progress.update(task, description=f"[dim]{fn.name[:30]} (cached)[/dim]")
                 cached = db.get_function(binary_name, fn.address)

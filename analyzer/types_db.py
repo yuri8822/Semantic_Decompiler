@@ -1,12 +1,12 @@
 """
 Semantic memory database.
 
-Stores everything the pipeline learns across functions so later passes
+Stores everything the pipeline learns across functions so later functions
 and later runs can build on prior discoveries rather than starting blind.
 
 Schema overview
 ---------------
-functions        — per-function analysis state, one row per pass output
+functions        — per-function analysis state (one translation attempt per row)
 recovered_types  — inferred structs / classes / enums / typedefs
 variable_names   — inferred names for compiler-generated variable IDs
 call_graph       — caller→callee edges (populated from Ghidra export, joined
@@ -104,21 +104,11 @@ class SemanticDB:
         "name":         "TEXT    NOT NULL",
         "address":      "TEXT    NOT NULL",
         "signature":    "TEXT    DEFAULT ''",
-        "ai_name":      "TEXT    DEFAULT ''",  # name chosen by AI in pass 2 (locked in)
+        "ai_name":      "TEXT    DEFAULT ''",  # name chosen by the AI for this function
         "provider":     "TEXT    DEFAULT ''",  # which LLM provider produced the current results
         "summary":      "TEXT    DEFAULT ''",  # one-line AI-generated description
-        "pass1_output": "TEXT    DEFAULT ''",
-        "pass2_output": "TEXT    DEFAULT ''",
-        "pass3_output": "TEXT    DEFAULT ''",
-        "pass4_output": "TEXT    DEFAULT ''",
-        "pass5_output": "TEXT    DEFAULT ''",
-        "pass6_output": "TEXT    DEFAULT ''",
-        "final_cpp":    "TEXT    DEFAULT ''",
+        "final_cpp":    "TEXT    DEFAULT ''",  # the single translation pass's accepted output
         "analyzed_at":  "TEXT    DEFAULT (datetime('now'))",
-        # Architecture-mission Phase 6: how many bounded refinement rounds
-        # (typing <-> class-recon) have completed for this function, so a
-        # resumed run picks up mid-refinement rather than restarting it.
-        "refinement_round": "INTEGER NOT NULL DEFAULT 0",
     }
 
     def __init__(self, db_path: str):
@@ -234,16 +224,24 @@ class SemanticDB:
     def _migrate_functions_columns(self, conn):
         """
         Retrofit any `_FUNCTIONS_COLUMNS` entries missing from an existing
-        `functions` table — `CREATE TABLE IF NOT EXISTS` only helps brand-new
-        databases; a database created before a schema change would otherwise
-        crash on the first read/write of the new column (this has already
-        happened twice: `pass6_output`, then `provider`).
+        `functions` table (adds) and drop any columns the live table has
+        that are no longer declared (removes) — `CREATE TABLE IF NOT
+        EXISTS` only helps brand-new databases; a database created before a
+        schema change would otherwise crash on the first read/write of a
+        new column (this has already happened twice: `pass6_output`, then
+        `provider`), or just carry dead columns forever (the single-pass
+        rewrite dropped `pass1_output`..`pass6_output` and
+        `refinement_round` when the multi-pass pipeline was removed).
 
-        Tries the cheap path first (`ALTER TABLE ADD COLUMN`), which covers
-        ordinary additive columns. SQLite refuses that for anything with a
-        PRIMARY KEY/UNIQUE/CHECK constraint, a NOT NULL without a constant
-        default, or a non-constant DEFAULT (e.g. `datetime('now')`) — for
-        those, falls back to a full table rebuild.
+        Tries the cheap path first for both directions: `ALTER TABLE ADD
+        COLUMN` for additions, `ALTER TABLE DROP COLUMN` for removals
+        (available since SQLite 3.35; this project's environment runs
+        3.42+). SQLite refuses ADD COLUMN for anything with a PRIMARY
+        KEY/UNIQUE/CHECK constraint, a NOT NULL without a constant default,
+        or a non-constant DEFAULT (e.g. `datetime('now')`); DROP COLUMN is
+        refused if the column is part of a UNIQUE/PRIMARY KEY constraint,
+        an index, or a generated-column expression. Either failure falls
+        back to a full table rebuild.
 
         A database missing `binary` predates per-binary address scoping —
         its UNIQUE constraint is on `address` alone, which ALTER TABLE
@@ -253,7 +251,8 @@ class SemanticDB:
         """
         existing = {row["name"] for row in conn.execute("PRAGMA table_info(functions)")}
         missing = [col for col in self._FUNCTIONS_COLUMNS if col not in existing]
-        if not missing:
+        obsolete = [col for col in existing if col not in self._FUNCTIONS_COLUMNS and col != "id"]
+        if not missing and not obsolete:
             return
 
         force_rebuild = "binary" in missing
@@ -265,10 +264,15 @@ class SemanticDB:
                     conn.execute(f"ALTER TABLE functions ADD COLUMN {col} {self._FUNCTIONS_COLUMNS[col]}")
                 except sqlite3.OperationalError:
                     needs_rebuild.append(col)
+            for col in obsolete:
+                try:
+                    conn.execute(f"ALTER TABLE functions DROP COLUMN {col}")
+                except sqlite3.OperationalError:
+                    needs_rebuild.append(col)
 
         if force_rebuild or needs_rebuild:
             reason = ("missing per-binary address scoping" if force_rebuild
-                      else f"add: {', '.join(needs_rebuild)}")
+                      else f"add/drop: {', '.join(missing + obsolete)}")
             print(f"[types_db] Rebuilding functions table ({reason})")
             self._rebuild_functions_table(conn)
 
@@ -355,13 +359,6 @@ class SemanticDB:
                     signature = excluded.signature
             """, (binary, address, name, signature))
 
-    def set_pass_output(self, binary: str, address: str, pass_num: int, output: str):
-        col = f"pass{pass_num}_output"
-        with self._conn() as conn:
-            conn.execute(f"""
-                UPDATE functions SET {col} = ? WHERE binary = ? AND address = ?
-            """, (output, binary, address))
-
     def set_final_cpp(self, binary: str, address: str, cpp: str):
         with self._conn() as conn:
             conn.execute("""
@@ -384,32 +381,20 @@ class SemanticDB:
                 UPDATE functions SET provider = ? WHERE binary = ? AND address = ?
             """, (provider, binary, address))
 
-    def clear_pass_data(self, binary: str, address: str):
+    def clear_result(self, binary: str, address: str):
         """
-        Wipe all pass outputs, final_cpp, ai_name, summary, and the
-        refinement-round counter for a function. Used when switching
-        providers, so stale results from a different provider can never be
-        left dangling under the new provider's marker — otherwise an
-        interruption right after the switch (before the new provider has
-        produced anything) would let old, unmigrated data masquerade as
-        "complete" under the new provider on a later resumed run. Also
-        resets refinement_round — a different provider's earlier round
-        count has no bearing on this provider's fresh attempt.
+        Wipe final_cpp, ai_name, and summary for a function. Used when
+        switching providers, so a stale result from a different provider
+        can never be left dangling under the new provider's marker —
+        otherwise an interruption right after the switch (before the new
+        provider has produced anything) would let old data masquerade as
+        "complete" under the new provider on a later resumed run.
         """
         with self._conn() as conn:
             conn.execute("""
-                UPDATE functions SET
-                    pass1_output = '', pass2_output = '', pass3_output = '',
-                    pass4_output = '', pass5_output = '', pass6_output = '',
-                    final_cpp = '', ai_name = '', summary = '', refinement_round = 0
+                UPDATE functions SET final_cpp = '', ai_name = '', summary = ''
                 WHERE binary = ? AND address = ?
             """, (binary, address))
-
-    def set_refinement_round(self, binary: str, address: str, round_num: int):
-        with self._conn() as conn:
-            conn.execute("""
-                UPDATE functions SET refinement_round = ? WHERE binary = ? AND address = ?
-            """, (round_num, binary, address))
 
     def is_complete_for_provider(self, binary: str, address: str, provider: str) -> bool:
         """
@@ -433,12 +418,6 @@ class SemanticDB:
                 SELECT * FROM functions WHERE binary = ? AND address = ?
             """, (binary, address)).fetchone()
         return dict(row) if row else None
-
-    def get_pass_output(self, binary: str, address: str, pass_num: int) -> str:
-        fn = self.get_function(binary, address)
-        if not fn:
-            return ""
-        return fn.get(f"pass{pass_num}_output", "") or ""
 
     def get_summary(self, binary: str, address: str) -> str:
         fn = self.get_function(binary, address)

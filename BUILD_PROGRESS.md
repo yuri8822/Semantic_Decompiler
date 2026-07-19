@@ -1747,6 +1747,268 @@ when a round actually completes during the current invocation.
 
 ---
 
+## What was built — session 30
+
+Real bug found and fixed immediately, surfaced by the user's own live
+102-function Chess.exe run (bonsai) using the finished Phase 1-6 pipeline
+for the first time — exactly the kind of thing only a real run surfaces.
+
+### The bug
+`validate_transition()`'s branch-count check (Phase 4, session 27) used a
+pure 30%-relative threshold (`new_branches < cfg_branches * 0.7`) with no
+absolute floor. At a small baseline this breaks down completely: for
+`cfg_branches = 1`, the reject threshold becomes `< 0.7`, so **any**
+output with 0 branch keywords rejects — including a completely correct,
+faithful translation. Confirmed live in the user's own log:
+`WinMainCRTStartup`, `mainCRTStartup`, and `main` — trivial CRT
+dispatchers whose only real content is `return __tmainCRTStartup();`, with
+zero legitimate branches — got rejected, retried, rejected again, and
+reverted on **every single one of their 6 passes**. Ghidra's raw CFG
+reported "~1" conditional branch for these functions (almost certainly
+compiler-generated boilerplate — a stack-check jump or similar — that
+doesn't survive decompilation and shouldn't), and the check had no way to
+tell that apart from a real, meaningful branch. Net effect: double the
+LLM calls on every pass for these functions, for zero benefit, and they
+shipped as completely unrefined raw decompiled text across the whole run
+— worse than if the check didn't exist at all for this class of function.
+
+### Fix — `ai/translator.py`
+Added `BRANCH_DROP_FLOOR = 2`. The check now rejects only if
+`dropped > max(BRANCH_DROP_FLOOR, cfg_branches * 0.3)` — the absolute
+floor dominates at small baselines (a drop of 1 branch never rejects
+regardless of percentage), while the original 30%-relative behavior is
+essentially unchanged at larger baselines (matches within rounding).
+
+### Verification
+Re-tested against the exact real values from the user's own log line by
+line: `cfg=1, new=0` (the `WinMainCRTStartup`-shaped case) now correctly
+**accepts**. `pre_c_init`'s three real rejections from the same log
+(`cfg=11` dropping to 3, 5, and 6) all **still correctly reject** —
+confirming the fix targets the small-baseline false positive specifically
+without weakening the check for functions where the original collapse was
+real. Re-ran the original Phase 4 regression pair (massive drop still
+rejected, moderate legitimate reduction still accepted) to confirm no
+regression there either.
+
+---
+
+## What was built — session 31
+
+Follow-up to session 30, at the user's explicit request to properly
+rewrite the validation checks rather than keep patching constants — a
+second live run (`--restart`) confirmed the branch-count fix worked for
+the small-baseline case, but surfaced the *same underlying problem* at a
+larger scale, plus an identical unfixed bug in a sibling check.
+
+### Problem 1: `pre_c_init` stuck rejecting on every pass, same root cause as session 30 — just not small enough to hit the floor
+Every single pass for `pre_c_init` rejected with "branch count dropped
+from ~11 to 3" (or 2, 4, 6). Session 30's floor only helps when the
+*absolute* drop is small; `pre_c_init`'s gap between Ghidra's raw-CFG
+count (11) and reality is itself the problem. Confirmed directly against
+the real cached Ghidra export (`data/ghidra_json/Chess.exe.json`): the
+*actual decompiled C* for `pre_c_init` has only **3** real branch
+keywords — nowhere near "~11". The raw CFG metric counts machine-code-
+level basic-block splits (compiler-generated stack checks, short-circuit
+evaluation splitting one `&&` into two blocks), which don't correspond
+1:1 to source-level conditionals. No amount of threshold-tuning fixes
+this — the check was comparing against the wrong ground truth entirely.
+
+### Problem 2: the stack-variable-count check has the identical missing-floor bug, never fixed
+`operator<<`, `operator.new[]`, and `__gcc_deregister_frame` all showed
+repeated "local variable count dropped from 2 to 0" rejections — the same
+missing-absolute-floor pattern as session 30's branch-count bug, just in
+the sibling check (`if prev_locals >= 2 and new_locals < prev_locals * 0.5`
+means *any* drop from 2 to 0 always rejects). These are thin
+operator-overload-shaped functions that plausibly need zero real named
+locals in a correct form.
+
+### The rewrite — `ai/translator.py`
+- New shared `_drop_exceeds_threshold(before, after, floor, relative)`:
+  requires **both** an absolute floor and the relative percentage to be
+  exceeded before flagging a drop as genuine information loss, rather than
+  baseline noise. Both checks now go through this one helper instead of
+  duplicating slightly-different threshold math.
+- **Branch-count check's baseline changed entirely**: instead of parsing
+  `cfg_summary`'s `Cond. branches:` figure (Ghidra's raw CFG block metric),
+  it now counts branch keywords in `function_data["decompiled"]` — the
+  function's own original decompiled C, a much closer source-level ground
+  truth (Ghidra's own decompiler has already collapsed most machine-code
+  noise into readable structure). `validate_transition()`'s signature
+  changed from `cfg_summary` to `original_code` accordingly; `_run_pass()`
+  now passes `function_data.get("decompiled", "")`. `cfg_summary` remains
+  used elsewhere (prompt-building) — this only removes its role in this
+  one check, which was the only place it fed a decision rather than context.
+- **Stack-variable-count check now uses the same shared helper**, with its
+  own separately-tuned `STACK_VAR_DROP_FLOOR`.
+- **A boundary bug found and fixed while verifying the rewrite itself**:
+  first tried `BRANCH_DROP_FLOOR = 2` (matching the stack-variable floor)
+  — but a real test case (`pre_c_init`-shaped, 2 real branches fully
+  gutted to 0) revealed this floor was too generous: `dropped=2` doesn't
+  exceed a `floor=2` with strict `>`, so a *complete* wipe of a genuinely
+  2-branch function slipped through untouched. Tuned `BRANCH_DROP_FLOOR`
+  down to `1` (a drop must exceed 1, so 2→0 now correctly rejects while
+  1→0 still doesn't) — confirmed the two floors need different values
+  precisely because a fully-gutted branch-having function is real
+  information loss, while a fully-emptied 2-local operator-overload is
+  routinely legitimate; verified both boundary cases explicitly rather
+  than assuming one floor value suits both checks.
+
+### Verification
+- Re-ran the full original Phase 4 regression set (12 checks) against the
+  new `validate_transition()` signature — all pass unchanged.
+- Re-tested the exact real scenarios from **both** live logs: the
+  `WinMainCRTStartup`-shaped case (real 0-branch baseline) now accepts;
+  the `pre_c_init`-shaped case (real 2-3-branch baseline, correct
+  translation) now accepts; a genuinely fully-gutted `pre_c_init`-shaped
+  case still correctly rejects (the boundary bug found above); the
+  `operator<<`-shaped 2→0 local-var case now accepts; a real 6→2
+  collapse (matching `pre_cpp_init`'s actual log line) still correctly
+  rejects.
+- Re-ran the entire Phase 6 suite (4 scenarios) to confirm the
+  `validate_transition()` signature change didn't disturb refinement or
+  resume — all still pass.
+- **Verified against the real cached Ghidra export**, not just synthetic
+  text: pulled the actual `decompiled` field for `WinMainCRTStartup`,
+  `mainCRTStartup`, and `pre_c_init` from `data/ghidra_json/Chess.exe.json`
+  and ran the real branch-counting logic against it directly — confirmed
+  0, 0, and 3 real branches respectively, decisively confirming the new
+  baseline is far more accurate than the raw CFG's reported "~1" and "~11".
+
+---
+
+## What was built — session 32
+
+**Architectural pivot: single-pass translation, replacing the entire
+multi-pass pipeline (sessions 1-31) outright.** This is the biggest change
+in the project's history — not an incremental fix, a full rewrite of the
+translation core. The `ARCHITECTURE_MISSION.md` 8-phase plan is superseded
+by this session; no further phases will be executed against it.
+
+### Why
+Built `prototype/run_single_pass.py` (now deleted, see below) to test the
+user's proposal directly: what if the AI does the *entire* reconstruction
+(cleanup, renaming, types, classes, consistency, beautification) in **one**
+prompt, fed the same rich context (deterministic evidence, library hints,
+whole-program context, callee/caller summaries, p-code IR, CFG summary)
+the 6-pass pipeline already gathers — instead of splitting the work across
+6 passes with name-lock, a callee-guard, validation/retry, and iterative
+refinement to manage the drift that splitting causes?
+
+Ran a real, controlled comparison: `pre_c_init` from `Chess.exe`, on the
+same live `bonsai` server, both ways. The existing 6-pass result (already
+in `semantic.db`) had a **more severe** bug than the single-pass result: an
+entire `_amsg_exit(8)` fatal-error path was silently deleted, hidden behind
+a comment confidently asserting it was "deliberately unreachable" — wrong,
+and undetected across all 6 passes and every validation check, because
+`_is_call_site()` doesn't exclude `//` comments, so a commented-out call
+still read as "still called." The single-pass result had a narrower bug (a
+boundary-condition inversion at one edge-case input value). For 1 LLM call
+instead of 6-12+, single-pass was not obviously worse — arguably the
+opposite on the one real function tested.
+
+The user's decision, after seeing this: go all-in on single-pass, and
+remove not just the pass loop but **every fix that existed solely to
+manage multi-pass problems** — the callee-guard, the validation/retry
+layer (return/branch/self-recursion/stack-variable checks), the name-lock,
+and the iterative-refinement loop. None of it has a reason to exist with
+one pass; trust the rich context instead of trying to catch and retry bad
+output.
+
+### What was removed entirely
+- The 6-pass loop, `_run_pass`'s per-pass-reuse shape, and the pass-level
+  resume-scan (resume is now binary: `is_complete_for_provider()` in
+  `main.py` already gates whether `translate()` is called at all).
+- The name-lock mechanism (`ai_name` capture after "pass 2", "LOCKED
+  FUNCTION NAME" prompt injection).
+- The entire validation layer from session 27, rewritten twice more in
+  sessions 30-31: `ValidationResult`, `validate_transition`,
+  `_dropped_callees`, `_is_call_site`, `_call_site_names`,
+  `_drop_exceeds_threshold`, `_count_branches`, `_count_local_decls`, and
+  every constant/regex backing them (`BRANCH_DROP_FLOOR`,
+  `STACK_VAR_DROP_FLOOR`, `_RETURN_RE`, `_BRANCH_KEYWORDS_RE`,
+  `_LOCAL_DECL_RE`) — all dead code with no remaining callers once
+  validation itself was removed.
+- The entire iterative-refinement loop from session 29
+  (`_extract_type_names`, the refinement while-loop, the reapply-5-6 step,
+  `MAX_REFINEMENT_ROUNDS`).
+- `ai/prompts.py`'s `PASS1_SYSTEM`..`PASS6_SYSTEM`, `SYSTEMS`, and every
+  `pass_num`-gated section of `build_user_prompt()`.
+- `analyzer/types_db.py`'s `pass1_output`..`pass6_output` and
+  `refinement_round` columns, and `set_pass_output`/`get_pass_output`/
+  `set_refinement_round`.
+- `config.py`'s `NUM_PASSES`/`PASS_NAMES`/`MAX_REFINEMENT_ROUNDS`;
+  `main.py`'s `--passes` flag.
+- The `prototype/` folder itself, once its content was fully promoted —
+  it had served its purpose (reaching this decision) and the user asked
+  for it to be removed rather than kept as a standing tool.
+
+### What was kept, because it's the "rich context" the single pass runs on, not multi-pass bloat
+The entire knowledge-graph layer built in sessions 21-28 is untouched:
+`analyzer/types_db.py`'s entities/entity_facts/relationships/contradictions
+and `compute_confidence()`, `analyzer/cfg_builder.py`'s
+`analyze_deterministic()`, `analyzer/library_signatures.py`, and
+`main.py`'s Step 3 seed loop that populates all of it. Also kept:
+`extract_function_name()` (still needed to name output for
+`output/writer.py`/`function_index.txt`) and `_harvest_types()` (still
+needed to share discovered types across functions in the same run) —
+neither is about managing passes, both are needed regardless of pass count.
+
+### The new shape
+- `ai/prompts.py`: one `SYSTEM_PROMPT` describing all six reconstruction
+  goals as a single task, and `build_user_prompt()` with every context
+  section always included (no `pass_num` gating needed).
+- `ai/translator.py`: `MultiPassTranslator` → `FunctionTranslator`.
+  `translate()` is now: gather rich context (unchanged) → one LLM call
+  (`pass_num=4` fixed, to keep selecting whichever "heavy" tier a provider
+  splits on) → strip fences → persist `final_cpp` → extract name → harvest
+  types → summarise. No validation call, no retry, no revert.
+- `analyzer/types_db.py`: `_migrate_functions_columns` now detects
+  *obsolete* columns (not just missing ones) and drops them via
+  `ALTER TABLE DROP COLUMN` (confirmed available: this environment runs
+  SQLite 3.42.0, past the 3.35 minimum), falling back to the existing
+  rebuild path only if a DROP fails — same try-cheap-then-rebuild
+  convention already used for the ADD direction. `clear_pass_data()` →
+  `clear_result()`, now only clearing `final_cpp`/`ai_name`/`summary`.
+- Opportunistic fix while `ai/translator.py` was being reshaped anyway:
+  `_harvest_types`'s `_TYPE_START_RE` now also matches `typedef struct`/
+  `typedef enum` forms (previously only bare `struct|class|enum`),
+  matching `output/writer.py`'s already-more-complete equivalent regex —
+  the new single-pass prompt explicitly asks for typedefs, so this gap
+  would have bitten more often than before.
+
+### Verification
+- Full functional test suite against the new `FunctionTranslator` with a
+  mocked LLM: confirmed exactly one main call (`pass_num=4`) plus one
+  summary call (no retries, no extra rounds); `final_cpp`/`ai_name`/
+  `provider`/`summary` all persist correctly; the typedef harvest fix
+  actually works end-to-end; the empty-decompiled-input stub path still
+  returns without calling the LLM; switching providers correctly clears
+  the prior provider's stale result via `clear_result()`; and
+  `is_complete_for_provider()` (the resume gate `main.py` checks before
+  calling `translate()` at all) still works against the simplified schema.
+- Schema migration verified against a **real copy** of the actual
+  `semantic.db` (never the live file): 99 real completed functions, all
+  obsolete columns cleanly dropped via the cheap `ALTER TABLE DROP COLUMN`
+  path (no rebuild fallback needed), and every real value (`name`,
+  `ai_name`, `provider`, `summary`, `final_cpp`) survived byte-for-byte
+  identical.
+- Repo-wide grep after every file change for any dangling reference to a
+  removed name (`MultiPassTranslator`, `validate_transition`, `NUM_PASSES`,
+  `refinement_round`, `pass1_output`..`pass6_output`, etc.) — clean outside
+  of historical comments explaining what was removed and why.
+- `python main.py --help` runs cleanly with the new flag set (`--passes`
+  gone, `--restart`'s help text reworded).
+
+### Known-limitations items now superseded by this rewrite (not fixed, just no longer applicable)
+Item 6 (callee-guard blind spot) and the "partially mitigated in session
+27" note on item 8 (self-recursion) both describe protections that no
+longer exist — the callee-guard and the whole validation layer were
+removed in this session, not improved. See the updated notes on those
+items below. Item 4's mention of "the callee-guard logic in
+`ai/translator.py`" is similarly moot — there is no callee-guard anymore.
+
+---
+
 ## Known limitations / next steps
 
 ### Still to build
@@ -1784,21 +2046,26 @@ when a round actually completes during the current invocation.
    and `get_callee_summaries`/`get_caller_summaries` (what actually feeds
    prompts today) are untouched and still join by name — this gap is only
    closed for the graph's own data so far, not for what the AI passes
-   currently see. The callee-guard logic in `ai/translator.py` also still
-   treats callees as bare name strings. Fully closing this for prompt
-   context is a later phase of the architecture-mission plan (see session 21).
+   currently see. ~~The callee-guard logic in `ai/translator.py` also still
+   treats callees as bare name strings.~~ **Moot as of session 32** — the
+   callee-guard (and the whole validation layer it was part of) was
+   removed entirely in the single-pass rewrite, not fixed. Fully closing
+   the name-vs-address gap for prompt context (`get_callee_summaries`/
+   `get_caller_summaries`) remains open, independent of that removal.
 
 5. **analyzeHeadless path** — `GHIDRA_PATH` in `config.py` is a machine-specific
    absolute path (currently a local dev path). Update it before running on
    another machine.
 
-6. **Callee guard blind spot** — the pass ≥3 callee-drop check (`ai/translator.py`,
-   hardened in session 6 to check real call sites instead of bare name
-   presence — see session 6) only fires while a callee's *original* Ghidra
-   name is still being called under that name. Once pass 2 renames a
-   callee's call site, that callee is unprotected for the rest of the
-   pipeline — this part of the gap is unchanged by the session 6 fix. Future:
-   track renamed callee names too, not just the original list.
+6. ~~**Callee guard blind spot**~~ **Superseded in session 32** — the
+   callee-guard described here (hardened in session 6, generalized into
+   the Phase 4 validation layer in session 27) was removed entirely in the
+   single-pass rewrite, not fixed. There is no callee-guard anymore; the
+   pipeline trusts the single reconstruction pass's output directly. Kept
+   for history: the pass ≥3 callee-drop check only fired while a callee's
+   *original* Ghidra name was still being called under that name — once a
+   pass renamed a callee's call site, that callee became unprotected for
+   the rest of the (now-removed) pipeline.
 
 7. ~~Bonsai provider is untested against a live server~~ **Resolved 2026-07-17.**
    Verified against a real running server (`Bonsai-27B-Q1_0.gguf` via the
@@ -1832,13 +2099,15 @@ when a round actually completes during the current invocation.
    untouched by that leak too). Needs a closer look once a clean re-run
    (reasoning off) is available to compare against — worth checking whether
    it's Bonsai-specific or shows up with other providers too.
-   **Partially mitigated in session 27**: the new validation layer's
+   ~~**Partially mitigated in session 27**: the new validation layer's
    self-recursion check now hard-rejects a pass that *newly introduces* a
-   call to the function's own locked name, triggering a retry-with-feedback
-   and falling back to the previous pass's (non-recursive) output if the
-   retry doesn't fix it — so this specific pattern can no longer silently
-   ship. The underlying hallucination tendency itself is still unexplained
-   and unfixed; this only stops it from reaching `recovered.cpp`.
+   call to the function's own locked name...~~ **That mitigation was
+   removed in session 32** along with the entire validation layer (the
+   single-pass rewrite trusts the reconstruction output directly, with no
+   retry/reject mechanism). This pattern can silently ship again if it
+   recurs. The underlying hallucination tendency itself was never
+   explained or fixed at the root — only ever caught after the fact, and
+   now not even that.
 
 9. ~~`ir_builder.py`'s varnode regex likely never matches real p-code
    text~~ **Fixed in session 23.** `_VARNODE_RE` had no whitespace

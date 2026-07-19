@@ -21,8 +21,8 @@ DB_PATH = str(PROJECT_ROOT / "semantic.db")
 LLM_PROVIDER = "anthropic"
 
 # Anthropic (cloud)
-ANTHROPIC_MODEL_HEAVY = "claude-opus-4-8"    # passes 3, 4 — type inference, class reconstruction
-ANTHROPIC_MODEL_FAST  = "claude-sonnet-4-6"  # passes 1, 2, 5, 6
+ANTHROPIC_MODEL_HEAVY = "claude-opus-4-8"    # the single reconstruction call (ai/translator.py always requests the heavy tier)
+ANTHROPIC_MODEL_FAST  = "claude-sonnet-4-6"  # the lightweight one-line summary call
 
 # Xiaomi MiMo — https://platform.xiaomimomo.com
 XIAOMI_BASE_URL = "https://api.xiaomimimo.com/anthropic/"
@@ -57,23 +57,3 @@ DECOMPILER_TIMEOUT_SECONDS = 60
 # always unconditional, so nothing is ever missing from disk at the end.
 OUTPUT_WRITE_EVERY_N_FUNCTIONS = 5
 OUTPUT_WRITE_EVERY_SECONDS = 30
-
-# --- Pipeline ---
-NUM_PASSES = 6
-
-# Architecture-mission Phase 6: bounded iterative refinement. After the
-# initial linear 1..N pass sequence, typing (pass 3) and class
-# reconstruction (pass 4) may re-run against each other up to this many
-# extra rounds if class reconstruction surfaces genuinely new type/class
-# definitions type inference didn't have when it ran. A hard backstop
-# against a pathological pair of passes re-triggering each other forever —
-# most functions converge (or need nothing) in 0-1 rounds.
-MAX_REFINEMENT_ROUNDS = 3
-PASS_NAMES = [
-    "cleanup",           # Pass 1: structural cleanup
-    "renaming",          # Pass 2: variable/function renaming
-    "type_inference",    # Pass 3: struct/enum/typedef recovery
-    "class_reconstruction",  # Pass 4: C++ class/vtable recovery
-    "consistency",       # Pass 5: cross-function naming alignment
-    "beautification",    # Pass 6: final C++ polish
-]

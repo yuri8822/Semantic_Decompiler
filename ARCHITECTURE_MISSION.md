@@ -1,6 +1,25 @@
 # Semantic Decompiler — Architecture Mission
 
-## Progress
+## ⚠ Superseded (BUILD_PROGRESS.md, session 32)
+
+This 8-phase plan is **superseded** by a single-pass architectural rewrite
+decided and executed in session 32 — no further phases will be executed
+against it. A live comparison test showed the 6-pass pipeline (with all of
+Phases 4-6's name-lock/validation/retry/refinement machinery) produced a
+*more severe* undetected bug than one well-evidenced single pass, for
+1 LLM call instead of 6-12+. The decision was to remove every fix that
+existed solely to manage multi-pass drift (the callee-guard, the
+validation/retry layer, the name-lock, the iterative-refinement loop) —
+none of it has a reason to exist with one pass.
+
+**What survives, unchanged, inside the new architecture:** the knowledge-
+graph layer built in Phases 1-3/5 (`analyzer/types_db.py`'s entities/facts/
+relationships/confidence, `analyzer/cfg_builder.py`'s deterministic
+evidence, `analyzer/library_signatures.py`) — none of that was multi-pass
+machinery, it's the rich context the single pass now runs on directly.
+See `BUILD_PROGRESS.md` session 32 for the full rationale and what changed.
+
+## Progress (historical — describes the now-superseded 8-phase plan)
 
 Scoped down and being executed as an 8-phase plan (excludes items #8/#9/#17
 and the recompile-equivalence part of #18 below — see rationale in the plan
@@ -120,6 +139,37 @@ narrated per-phase in `BUILD_PROGRESS.md`.
   Phase 4's validation layer protects the function's real content even
   when Phase 6's refinement trigger fires for real against genuinely
   messy historical data.
+- **Branch-count check bug fix — done (BUILD_PROGRESS.md, session 30, out
+  of band from the phase plan).** The user's own live 102-function
+  Chess.exe run surfaced a real bug in Phase 4's branch-count check: a
+  pure 30%-relative threshold with no absolute floor meant any function
+  with a small baseline CFG branch count (e.g. `cfg_branches=1`) could
+  *never* pass, even with a completely correct, faithful translation —
+  confirmed live: three trivial CRT dispatcher functions
+  (`WinMainCRTStartup`, `mainCRTStartup`, `main`) got rejected on every
+  single one of their 6 passes, burning double the LLM calls for zero
+  benefit and shipping as completely unrefined raw decompiled text.
+  Fixed by adding `BRANCH_DROP_FLOOR = 2` alongside the percentage
+  threshold. Verified against the exact real values from the user's log —
+  the false-positive case now accepts, while `pre_c_init`'s real,
+  legitimate rejections from the same log still correctly reject.
+- **Validation-check rewrite — done (BUILD_PROGRESS.md, session 31, out of
+  band from the phase plan, at the user's explicit request).** A second
+  live run surfaced the same branch-count problem at a scale the
+  session-30 floor didn't reach (`pre_c_init`: real decompiled branch
+  count is 3, but Ghidra's raw CFG reported "~11" — no threshold tuning
+  fixes a wrong ground truth), plus an identical missing-floor bug in the
+  stack-variable-count check. Rewrote both: the branch-count check's
+  baseline changed entirely, from Ghidra's raw CFG metric to the
+  function's own original decompiled C (a real, source-level ground
+  truth); both checks now share one `_drop_exceeds_threshold()` helper
+  with separately-tuned floors. Found and fixed a boundary bug in the
+  rewrite itself before shipping (a floor of 2 let a fully-gutted
+  2-branch function slip through). Verified against the full original
+  regression set, the exact real scenarios from both live logs, the full
+  Phase 6 suite, and — decisively — the real cached Ghidra export
+  (confirmed 0/0/3 real branches for `WinMainCRTStartup`/`mainCRTStartup`/
+  `pre_c_init`, vs. the raw CFG's "~1"/"~1"/"~11").
 - **Phases 7-8 — not started.** Semantic checkpoints/quality metrics, and
   `output/writer.py` catching up to the graph. Sequenced risk-ascending;
   each phase requires a separate go-ahead before starting.

@@ -1,27 +1,24 @@
 # Semantic Decompiler
 
-An AI-assisted reverse engineering tool that goes beyond traditional decompilation. Instead of producing raw pseudocode, it uses a multi-pass AI pipeline to reconstruct **semantically meaningful C++** — with recovered names, inferred types, and documented intent.
+An AI-assisted reverse engineering tool that goes beyond traditional decompilation. Instead of producing raw pseudocode, it feeds a single, richly-evidenced AI reconstruction pass to produce **semantically meaningful C++** — with recovered names, inferred types, and documented intent.
 
 ```
-Binary → Ghidra analysis → IR normalization → Multi-pass AI reconstruction → Recovered C++ project
+Binary → Ghidra analysis → IR normalization → Single-pass AI reconstruction → Recovered C++ project
 ```
 
 ---
 
 ## How it works
 
-Traditional decompilers stop at pseudocode. This tool uses that pseudocode as a starting point and runs it through a pipeline of focused AI passes:
+Traditional decompilers stop at pseudocode. This tool uses that pseudocode as a starting point and, in one pass, asks the model to do the full reconstruction — cleanup, renaming, type inference, class reconstruction, cross-function consistency, and beautification — together, backed by as much ground-truth evidence as static analysis can produce:
 
-| Pass | Goal |
-|------|------|
-| 1 — Cleanup | Remove compiler boilerplate, simplify expressions |
-| 2 — Renaming | Infer meaningful names from strings, API calls, patterns |
-| 3 — Type inference | Recover structs, enums, typedefs from pointer arithmetic |
-| 4 — Class reconstruction | Identify C++ classes, vtables, constructors |
-| 5 — Consistency | Align names and types across caller/callee boundaries |
-| 6 — Beautification | Final C++ polish, const qualifiers, doc comments |
+- **Deterministic evidence** — calling convention, real dominator-based loop analysis, propagated constants, and pointer-aliasing hints, all computed by static analysis, not guessed by the AI.
+- **Known-library hints** — detected STL/common-library usage, so the model reuses the real type instead of reinventing its internals.
+- **Whole-program context** — classes and types already recovered elsewhere in the same binary.
+- **Callee/caller summaries** — what a function's neighbors in the call graph are already known to do.
+- **P-code IR and CFG summary** — a readable rendering of the actual instruction-level control flow.
 
-Each pass feeds its output into the next. Context accumulates in a SQLite semantic database across functions — types recovered in one function inform the analysis of another.
+A SQLite knowledge graph persists all of this across functions and across runs — types and summaries recovered in one function inform the analysis of another, and the same graph feeds richer context into every subsequent function in a run.
 
 ---
 
@@ -72,7 +69,7 @@ GHIDRA_PATH = r"C:\path\to\ghidra\support\analyzeHeadless.bat"
 # Default provider: "anthropic", "xiaomi", "ollama", or "bonsai"
 LLM_PROVIDER = "anthropic"
 
-# Anthropic models (heavy for passes 3-4, fast for the rest)
+# Anthropic models (heavy for the reconstruction pass, fast for the one-line summary)
 ANTHROPIC_MODEL_HEAVY = "claude-opus-4-8"
 ANTHROPIC_MODEL_FAST  = "claude-sonnet-4-6"
 
@@ -100,21 +97,21 @@ python main.py <binary> [options]
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--provider` | `anthropic` | LLM provider: `anthropic`, `xiaomi`, `ollama`, `bonsai` |
-| `--passes` | `6` | Number of AI passes (1–6) |
 | `--limit` | `0` (all) | Process only the first N functions |
 | `--output` | `output/recovered` | Output directory |
 | `--skip-ghidra` | — | Reuse existing Ghidra JSON export (now automatic if one exists — kept for explicitness) |
 | `--force-ghidra` | — | Re-run Ghidra even if an export already exists |
+| `--restart` | — | Ignore all resume/cache state and retranslate every function |
 | `--verbose` | — | Stream Ghidra output to stdout |
 
 **Examples:**
 
 ```bash
-# Full 6-pass run on a binary using Anthropic
+# Full run on a binary using Anthropic
 python main.py target.exe --provider anthropic
 
-# Quick 3-pass test on the first 10 functions using Xiaomi MiMo
-python main.py target.exe --provider xiaomi --passes 3 --limit 10
+# Quick test on the first 10 functions using Xiaomi MiMo
+python main.py target.exe --provider xiaomi --limit 10
 
 # Local run with Ollama, reusing a prior Ghidra export
 python main.py target.exe --provider ollama --skip-ghidra
@@ -123,7 +120,7 @@ python main.py target.exe --provider ollama --skip-ghidra
 python main.py target.exe --provider bonsai --skip-ghidra
 
 # Analyze a Windows system binary
-python main.py "C:\Windows\System32\find.exe" --provider xiaomi --passes 3 --limit 5
+python main.py "C:\Windows\System32\find.exe" --provider xiaomi --limit 5
 ```
 
 ---
@@ -145,14 +142,14 @@ The semantic database (`semantic.db`) persists across runs — types and summari
 ## Providers
 
 ### Anthropic
-Best output quality. Uses `claude-opus-4-8` for type inference and class reconstruction passes, `claude-sonnet-4-6` for lighter passes.
+Best output quality. Uses `claude-opus-4-8` for the reconstruction pass, `claude-sonnet-4-6` for the lightweight one-line summary.
 
 ```bash
 python main.py target.exe --provider anthropic
 ```
 
 ### Xiaomi MiMo
-Good quality, lower cost. Uses `mimo-v2.5-pro` for all passes via an Anthropic-compatible API.
+Good quality, lower cost. Uses `mimo-v2.5-pro` for every call via an Anthropic-compatible API.
 
 ```bash
 python main.py target.exe --provider xiaomi
@@ -204,17 +201,18 @@ analyzer/
   ghidra_runner.py          — Invokes Ghidra headless analysis
   parse_output.py           — Parses Ghidra JSON export into typed models
   ir_builder.py             — Converts P-Code to readable IR for AI context
-  cfg_builder.py            — Builds CFG summaries (loops, branches, complexity)
-  types_db.py               — SQLite semantic memory (types, summaries, call graph)
+  cfg_builder.py            — CFG summaries + deterministic evidence (loops, constants, aliasing)
+  library_signatures.py     — STL/known-library detection
+  types_db.py               — SQLite knowledge graph (entities, facts, relationships, confidence)
   known_apis.py             — Curated Windows/CRT API signature database
 
 ai/
-  translator.py             — Runs the multi-pass pipeline per function
+  translator.py             — Gathers evidence and runs the single reconstruction pass per function
   llm_client.py             — Thin facade that picks a provider and forwards complete()
-  prompts.py                — Per-pass system prompts and user prompt builder
+  prompts.py                — The single system prompt and user-prompt builder
   providers/
     base.py                 — BaseProvider ABC (one method: complete)
-    anthropic/anthropic_provider.py — Claude, heavy/fast model split for passes 3-4
+    anthropic/anthropic_provider.py — Claude, heavy/fast model split (reconstruction vs. summary)
     xiaomi/xiaomi_provider.py       — MiMo, Anthropic-compatible API
     ollama/ollama_provider.py       — Local, OpenAI-compatible endpoint
     bonsai/bonsai_provider.py       — Local Bonsai 27B (1-bit), OpenAI-compatible endpoint
@@ -233,14 +231,15 @@ ghidra_scripts/
 
 - **Static analysis is authoritative.** Ghidra's decompilation, CFG, and signatures are ground truth. The AI enhances semantics — it never invents logic.
 - **Function-level translation.** Each function is processed independently with its call-graph context, avoiding context window limits on large binaries.
-- **Semantic memory.** Types and summaries persist across functions. A struct discovered in one function automatically becomes context for its callers and callees.
-- **Provider-agnostic.** The same prompts run unchanged against any supported provider.
+- **Knowledge graph, not just memory.** Types, summaries, and deterministic evidence persist across functions and runs in a SQLite knowledge graph — a struct discovered in one function automatically becomes context for its callers and callees.
+- **One well-evidenced pass, not many thin ones.** A single reconstruction call, backed by as much ground-truth static-analysis evidence as can be gathered, rather than splitting the work across a sequential pipeline that can drift or contradict itself across steps.
+- **Provider-agnostic.** The same prompt runs unchanged against any supported provider.
 
 ---
 
 ## Limitations
 
-- Output quality depends heavily on the LLM and number of passes. More passes = better results but more cost/time.
+- Output quality depends heavily on the underlying LLM.
 - Heavily optimized or obfuscated binaries produce degraded Ghidra output that limits AI recovery.
-- C++ virtual dispatch and RTTI recovery is best-effort — pass 4 infers from patterns, not RTTI tables.
-- Generated code compiles conceptually but is not guaranteed to be link-compatible with the original.
+- C++ virtual dispatch and RTTI recovery is best-effort — inferred from patterns, not RTTI tables.
+- Generated code compiles conceptually but is not guaranteed to be link-compatible with the original, and nothing in the pipeline currently attempts to actually compile the output.
