@@ -13,8 +13,11 @@ Varnode format:
 import re
 from typing import Optional
 
-# Matches a single varnode token: (space,offset,size)
-_VARNODE_RE = re.compile(r'\((\w+),(0x[0-9a-fA-F]+|\d+),(\d+)\)')
+# Matches a single varnode token: (space,offset,size). Ghidra's real
+# PcodeOpAST.toString() output puts a space after each comma (e.g.
+# "(register, 0x0, 8)", not "(register,0x0,8)") — confirmed against a real
+# export (0 of 1939 real ops matched without \s*, 100% matched with it).
+_VARNODE_RE = re.compile(r'\((\w+),\s*(0x[0-9a-fA-F]+|\d+),\s*(\d+)\)')
 
 # Human-readable symbol for arithmetic/comparison mnemonics
 _BINARY_OPS = {
@@ -33,13 +36,6 @@ _BINARY_OPS = {
 # ---------------------------------------------------------------------------
 # Parsing
 # ---------------------------------------------------------------------------
-
-def _parse_varnode(s: str) -> Optional[dict]:
-    m = _VARNODE_RE.match(s.strip())
-    if not m:
-        return None
-    return {"space": m.group(1), "offset": m.group(2), "size": int(m.group(3))}
-
 
 def _parse_op(raw: str) -> dict:
     raw = raw.strip()
@@ -67,11 +63,15 @@ def _parse_op(raw: str) -> dict:
     inputs: list[dict] = []
 
     if len(parts) > 1:
-        # Split on ' , ' (Ghidra separates inputs with ' , ')
-        for tok in re.split(r'\s*,\s*', parts[1]):
-            vn = _parse_varnode(tok.strip())
-            if vn:
-                inputs.append(vn)
+        # Find each complete (space,offset,size) varnode directly instead of
+        # splitting on ' , ' first — a varnode's own internal commas (e.g.
+        # "(ram, 0x140006668, 8)") are indistinguishable from the top-level
+        # ' , ' separator between multiple inputs, so a naive split shreds
+        # every multi-field varnode into fragments that never match
+        # (confirmed against real multi-input ops like MULTIEQUAL, which
+        # always have two inputs).
+        for m2 in _VARNODE_RE.finditer(parts[1]):
+            inputs.append({"space": m2.group(1), "offset": m2.group(2), "size": int(m2.group(3))})
 
     return {"mnemonic": mnemonic, "output": output, "inputs": inputs, "raw": raw}
 

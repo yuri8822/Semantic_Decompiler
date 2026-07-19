@@ -22,12 +22,18 @@ narrated per-phase in `BUILD_PROGRESS.md`.
   `known_apis.library`. Verified against the same real `find.exe` export —
   along the way, found and fixed two real parsing bugs in this new code
   (a varnode regex missing whitespace tolerance, and a naive comma-split
-  that shreds multi-input operands), and separately flagged — but did
-  **not** fix — that the same two bugs likely also exist in
-  `ir_builder.py` itself, meaning the p-code IR shown to the AI in every
-  prompt for passes ≤3 has probably been silently degraded for the whole
-  project's history. See BUILD_PROGRESS.md session 22 and known-edge-case
-  #9 for the full writeup; left for a deliberate, separate fix.
+  that shreds multi-input operands).
+- **`ir_builder.py` bug fix — done (BUILD_PROGRESS.md, session 23, out of
+  band from the phase plan).** The same two bugs found in session 22 also
+  existed in `ir_builder.py` itself; user confirmed the app isn't in
+  production and asked for it to be fixed immediately rather than wait.
+  Fixed and verified against real data — old vs. new parse output compared
+  side-by-side on a real function confirmed the practical severity was
+  worse than the raw match-rate statistic implied: nearly every op with an
+  output varnode had been rendering as a garbled fragment of its own
+  output token with zero operands, not degraded-but-readable assembly.
+  Not retroactive — existing `semantic.db` translations were produced
+  against the old, garbled p-code context.
 - **Phases 3-8 — not started.** Evidence-based whole-program prompting, a
   validation layer, confidence-gated overwrite + contradiction detection,
   the iterative refinement loop, semantic checkpoints/quality metrics, and

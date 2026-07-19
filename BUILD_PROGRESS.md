@@ -1256,6 +1256,66 @@ deterministic side-data) — left for the user to decide whether/when to fix.
 
 ---
 
+## What was built — session 23
+
+Follow-up to session 22's flagged (but deliberately unfixed) discovery:
+the user confirmed the app isn't in production and asked for the
+`ir_builder.py` bug to be fixed now rather than left open. Applied the same
+two fixes already verified in `cfg_builder.py`'s copy of this logic:
+
+### `analyzer/ir_builder.py`
+- `_VARNODE_RE` gained the same `\s*` whitespace tolerance after each comma.
+- `_parse_op`'s input-splitting now finds complete `(space,offset,size)`
+  varnodes directly via `_VARNODE_RE.finditer(...)` instead of naively
+  splitting the operand text on every comma first (which shreds a
+  varnode's own internal commas, indistinguishable from the top-level
+  `" , "` separator between multiple inputs).
+- Removed `_parse_varnode()` — its only call site was the just-replaced
+  split loop, and it had no other callers anywhere in the codebase
+  (confirmed via a full-repo search before deleting).
+
+### Just how bad it actually was
+Comparing the old and new parse output side-by-side against a real
+function (`find.exe`'s `FUN_1400013f8`) made the severity concrete in a way
+the 0/1939-match statistic from session 22 didn't fully convey on its own:
+the old code didn't just fail to extract inputs — for an op like
+`"(register, 0x0, 8) CALL (ram, 0x1400041c0, 8) , (const, 0x0, 8)"`, the
+broken split left `mnemonic = "(register,"` (a garbled fragment of the
+*output* varnode, not the real opcode `CALL`), `output = None`, and
+`inputs = []`. Every single op with an output varnode — the large majority
+of any real function's p-code — fell through `_fmt_op`'s final generic
+fallback and rendered as just that garbled fragment with no operands
+(e.g. `"  (register, "`), not as anything resembling assembly. Only bare
+`---`-prefixed void ops (already a minority) had a chance at a correct
+mnemonic, and even those still lost every one of their own inputs to the
+same splitting bug. In short: the "P-CODE IR" block shown to the AI in
+every prompt for passes ≤3, across this entire project's history, has
+almost certainly been close to meaningless noise rather than merely
+"degraded."
+
+The fixed output for that same function is now correct, readable
+pseudo-assembly — clean comparisons, resolved CALL targets, `PTRADD`,
+`CAST`, `MULTIEQUAL`, `RETURN`, all with real operands instead of `?`
+placeholders or garbled fragments.
+
+### Verification
+- Syntax-checked the fixed file.
+- Re-derived the *old* buggy parse logic inline in a scratch script (same
+  regex/split as before the fix) and ran it side-by-side against the same
+  real `find.exe` p-code used in sessions 21-22, confirming both the
+  before state (garbled mnemonics, empty inputs, confirmed by direct
+  inspection) and the after state (`build_ir()`'s real, current output —
+  correct mnemonics and operands throughout).
+
+### Not done as part of this fix
+Any previously-completed translations in `semantic.db` were produced
+against the old, garbled IR context — this fix doesn't retroactively
+improve them. Re-running affected binaries (`--restart`) is a real cost
+(time/LLM spend) and a decision for whoever's paying for the specific
+provider in use, so left to the user rather than done automatically.
+
+---
+
 ## Known limitations / next steps
 
 ### Still to build
@@ -1342,30 +1402,21 @@ deterministic side-data) — left for the user to decide whether/when to fix.
    (reasoning off) is available to compare against — worth checking whether
    it's Bonsai-specific or shows up with other providers too.
 
-9. **`ir_builder.py`'s varnode regex likely never matches real p-code text
-   (found in session 22, not yet fixed)** — `_VARNODE_RE` has no whitespace
+9. ~~`ir_builder.py`'s varnode regex likely never matches real p-code
+   text~~ **Fixed in session 23.** `_VARNODE_RE` had no whitespace
    tolerance after the commas inside a `(space,offset,size)` token, but
    Ghidra's real `PcodeOpAST.toString()` output always includes a space
-   there (`"(register, 0x0, 8)"`). Confirmed directly: **0 of 1939** real
-   p-code ops from a real `find.exe` export matched this regex at all,
-   while a whitespace-tolerant version matched 100% of them. Since
-   `build_ir()` feeds its output into every AI prompt for passes ≤3, this
-   means the "P-CODE IR" context the model has been shown has likely been
-   silently degraded (garbled operands, `"?"` placeholders, or operations
-   misclassified as void) for this entire project's history — not a crash,
-   since `_parse_op` doesn't raise on a non-match, just produces
-   incomplete/wrong output that `build_ir()`'s per-op `try/except` never
-   catches (no exception is thrown). A second, related bug in the same
-   function: splitting a multi-input op's operand list on every comma
-   shreds each varnode's own internal commas too, indistinguishable from
-   the top-level `" , "` separator between multiple inputs (confirmed
-   against real `MULTIEQUAL` ops, which always have two inputs) — so even
-   after fixing the whitespace issue, multi-input ops would still parse
-   incorrectly without also fixing the splitting logic. Both were fixed in
-   `analyzer/cfg_builder.py`'s own (separate, newer) copy of this same
-   parsing logic during session 22, but `ir_builder.py` itself was
-   deliberately left untouched — fixing it changes what the AI has been
-   seeing in every prompt for the whole project, which is a real behavior
-   change to the already-shipping pipeline and outside the scope of what
-   was being worked on (deterministic side-data generation) when this was
-   found. Left for a deliberate, separate fix.
+   there. Confirmed directly: **0 of 1939** real p-code ops from a real
+   `find.exe` export matched the old regex; a whitespace-tolerant version
+   matched 100%. Combined with a second bug (naive comma-splitting shredded
+   multi-input operands), the practical effect — confirmed by directly
+   comparing old vs. new parse output on a real function — was that nearly
+   every op with an output varnode rendered as a garbled fragment of its
+   own output token (e.g. `"(register,"`) with zero operands, not
+   assembly-like text at all. Since `build_ir()` feeds every AI prompt for
+   passes ≤3, this means the "P-CODE IR" context has been close to
+   meaningless noise for this entire project's history. Both bugs are now
+   fixed (same fix already applied to `analyzer/cfg_builder.py`'s copy of
+   this logic in session 22); see session 23. Not retroactive — previously
+   completed translations in `semantic.db` were produced against the old,
+   garbled context and aren't automatically redone.
