@@ -34,42 +34,77 @@ _NAME_SKIP = frozenset({
 def extract_function_name(code: str, fallback: str) -> str:
     """
     Extract the function name the AI chose in its output.
-    Looks for the first function definition line (has parens, followed by {).
+    Looks for the first *top-level* function definition line (has parens,
+    followed by {, and not nested inside any braces — e.g. a class body).
     Tracks multi-line /* ... */ comments so a parenthesized word inside a
-    doc comment can't be mistaken for the function's own name.
+    doc comment can't be mistaken for the function's own name, and tracks
+    brace depth so a member declared inside an injected/leaked type
+    definition can't be mistaken for the actual function being translated
+    either — a real observed bug: a leaked "RECOVERED TYPES FROM OTHER
+    FUNCTIONS" block ahead of the real function caused `virtual ~Bishop()
+    {}` (a destructor nested inside `class Bishop { ... }`) to be matched
+    as if "Bishop" were the real, top-level function's name.
+
+    Also merges a parameter list split across multiple lines (common after
+    pass-6 beautification reformats a signature onto separate lines) before
+    checking for the opening brace — a one-line-only lookahead used to miss
+    the rename entirely whenever a signature spanned more than two lines,
+    silently falling back to the original Ghidra name instead.
     """
     in_comment = False
+    depth = 0
     lines = code.split("\n")
-    for i, line in enumerate(lines):
-        s = line.strip()
+    n = len(lines)
+    i = 0
+    while i < n:
+        s = lines[i].strip()
         if in_comment:
             if "*/" in s:
                 in_comment = False
+            i += 1
             continue
         if s.startswith("/*"):
             if "*/" not in s:
                 in_comment = True
+            i += 1
             continue
         if not s or s.startswith("//") or s.startswith("#"):
+            i += 1
             continue
-        if re.match(r'^(struct|class|enum|typedef|extern)\b', s):
-            continue
-        if "(" not in s:
-            continue
-        # Must be a definition: has { on this line or the very next
-        has_brace = "{" in s or (
-            i + 1 < len(lines) and lines[i + 1].strip().startswith("{")
+
+        is_type_decl = bool(re.match(r'^(struct|class|enum|typedef|extern)\b', s))
+        has_paren = "(" in s
+
+        # Merge continuation lines while a parameter list is still open
+        # (unbalanced parens) — the opening { can be several lines past
+        # where the parens finally close. Capped so malformed/unbalanced
+        # text can't spin: no real signature is anywhere near this long.
+        j = i
+        merged = s
+        paren_depth = merged.count("(") - merged.count(")")
+        MAX_CONTINUATION_LINES = 20
+        while has_paren and paren_depth > 0 and j + 1 < n and (j - i) < MAX_CONTINUATION_LINES:
+            j += 1
+            nxt = lines[j].strip()
+            merged += " " + nxt
+            paren_depth += nxt.count("(") - nxt.count(")")
+
+        # Must be a definition: has { in the merged signature, or on the
+        # very next line after it closes
+        has_brace = "{" in merged or (
+            j + 1 < n and lines[j + 1].strip().startswith("{")
         )
-        if not has_brace:
-            continue
-        # Skip forward declarations (ends with ; but no {)
-        sig = s.split("{")[0].rstrip()
-        if sig.endswith(";"):
-            continue
-        before_paren = sig.split("(")[0].rstrip()
-        m = re.search(r'\b([A-Za-z_]\w*)\s*$', before_paren)
-        if m and m.group(1) not in _NAME_SKIP:
-            return m.group(1)
+        sig = merged.split("{")[0].rstrip() if has_brace else merged
+        is_forward_decl = sig.endswith(";")  # ends with ; but no { — not a definition
+
+        if depth == 0 and not is_type_decl and has_paren and has_brace and not is_forward_decl:
+            before_paren = sig.split("(")[0].rstrip()
+            m = re.search(r'\b([A-Za-z_]\w*)\s*$', before_paren)
+            if m and m.group(1) not in _NAME_SKIP:
+                return m.group(1)
+
+        depth += merged.count("{") - merged.count("}")
+        i = j + 1
     return fallback
 
 

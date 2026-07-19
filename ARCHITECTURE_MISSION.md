@@ -34,6 +34,21 @@ narrated per-phase in `BUILD_PROGRESS.md`.
   output token with zero operands, not degraded-but-readable assembly.
   Not retroactive — existing `semantic.db` translations were produced
   against the old, garbled p-code context.
+- **`extract_function_name()` destructor-nesting bug fix — done
+  (BUILD_PROGRESS.md, session 24, out of band from the phase plan).**
+  Found while spot-checking a fresh `--restart` run's real output: a
+  function got mislabeled `Bishop` because pass 4 leaked an unrelated
+  "recovered types" block (containing `virtual ~Bishop() {}`) into its
+  output, and the name-extraction regex had no nesting-awareness, so it
+  grabbed the destructor's class name instead of the real, still-intact
+  top-level function. Fixed with brace-depth tracking (only accept a
+  candidate at depth 0); verified against the real leaked case, the 6
+  clean functions from the same run, and real legitimate standalone
+  destructor translations already in the DB (no regression). Also found —
+  but deliberately left unfixed, out of scope for what was asked — a
+  separate, pre-existing, unrelated limitation: multi-line signatures
+  (2+ lines before the opening brace) aren't detected at all, so some
+  real in-body renames never reach `function_index.txt`/the banner.
 - **Phases 3-8 — not started.** Evidence-based whole-program prompting, a
   validation layer, confidence-gated overwrite + contradiction detection,
   the iterative refinement loop, semantic checkpoints/quality metrics, and

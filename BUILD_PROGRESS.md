@@ -1316,6 +1316,72 @@ provider in use, so left to the user rather than done automatically.
 
 ---
 
+## What was built — session 24
+
+Follow-up to a real bug found while eyeballing a fresh `--restart` run's
+output on `Chess.exe` (7 functions, `bonsai`, done *after* sessions 22-23's
+fixes): `function_index.txt` and `recovered.cpp`'s banner labeled address
+`140001000` as `Bishop`, but that address is really `WinMainCRTStartup`.
+
+### Root cause, traced pass-by-pass through `semantic.db`, not guessed
+Passes 1-3 correctly preserved the real function
+(`g_mingw_app_type = 1; return __tmainCRTStartup();`). Pass 4 (class
+reconstruction) then prepended ~40 unrelated lines to this function's own
+output — literally the "RECOVERED TYPES FROM OTHER FUNCTIONS" prompt
+context (a `Bishop`/`Engine`/`Pawn`/enum dump from other functions in the
+same run), verbatim, ahead of the still-intact real function body. This is
+itself a real AI-quality bug (context leakage during pass 4, likely
+bonsai-specific) — not fixed here, and exactly the kind of thing the
+planned Phase 4 validation layer is meant to catch.
+
+`main.py` then calls `extract_function_name()` on that whole bloated final
+text to decide what to call the file section. The old implementation
+scanned top-to-bottom for the *first* line shaped like `identifier(...) {`
+with no awareness of nesting — and the first such line in the leaked
+content was `virtual ~Bishop() {}` (a destructor, inside `class Bishop {
+... }`). The regex extracting the identifier immediately before `(` has no
+special case for a leading `~`, so it read "Bishop" as the function's own
+name. Confirmed directly: re-running the unmodified function against the
+real stored `final_cpp` returned `'Bishop'`.
+
+### Fix — `ai/translator.py`
+`extract_function_name()` now tracks brace depth through the whole scan
+(comment-tracking was already there; this adds the same idea for `{`/`}`)
+and only accepts a candidate definition at depth 0 — i.e. genuinely
+top-level, not nested inside a class/struct body. This is a general
+structural fix (not a destructor-specific special case): a real, standalone
+destructor translated on its own (this pipeline emits those as flat
+functions, not nested class members) still sits at depth 0 and extracts
+correctly; it's only a destructor *nested inside an injected/leaked type
+definition* that now gets correctly skipped.
+
+### Verification against real data
+- Re-ran the fixed function against the exact real `final_cpp` that
+  triggered this: now correctly returns `'WinMainCRTStartup'`.
+- Re-ran it against the other 6 functions from the same fresh run —
+  identical results to before the fix (`pre_c_init`, `pre_cpp_init`,
+  `CRTStartupEntry`, `startup_crt_main`, `register_exit_handler`,
+  `__mingw_invalidParameterHandler`), confirming no regression on clean cases.
+- Pulled real, previously-completed standalone destructor translations
+  from an earlier full Chess.exe run (`~Engine`, `~__new_allocator`,
+  `~_Alloc_hider`, `~_Guard`) and confirmed the fix still extracts their
+  class names correctly (e.g. `~Engine` → `Engine`) — the depth-0
+  requirement doesn't regress the legitimate case.
+
+### Found, but not fixed — a separate, pre-existing, unrelated limitation
+While testing, `__mingw_invalidParameterHandler`'s real rename
+(`handle_invalid_parameter`, visible in the actual code body) wasn't
+detected — `extract_function_name()` fell back to the original name.
+Root cause: `has_brace`'s lookahead only checks the *very next* line for
+`{`, but this function's beautified signature spans six lines before its
+opening brace. Confirmed this is **pre-existing**, not caused by this
+session's fix, by running the original (pre-fix) logic against the same
+text and getting the identical fallback result. Left unfixed — out of
+scope for the destructor bug that was actually asked for — and flagged
+for the user to decide on separately.
+
+---
+
 ## Known limitations / next steps
 
 ### Still to build
@@ -1420,3 +1486,19 @@ provider in use, so left to the user rather than done automatically.
    this logic in session 22); see session 23. Not retroactive — previously
    completed translations in `semantic.db` were produced against the old,
    garbled context and aren't automatically redone.
+
+10. **`extract_function_name()`'s `has_brace` lookahead only checks one
+    line ahead (found in session 24, not fixed)** — a function whose
+    signature spans more than two lines (common after pass 6
+    beautification reformats a multi-parameter signature onto separate
+    lines) never has its opening `{` detected, so a real in-body rename
+    goes undetected and `function_index.txt`/the recovered.cpp banner keep
+    showing the original Ghidra name even though the code itself was
+    renamed. Confirmed real: `__mingw_invalidParameterHandler` was renamed
+    to `handle_invalid_parameter` in its own function body, but the banner
+    still reads `__mingw_invalidParameterHandler`. Confirmed pre-existing
+    (not introduced by session 24's destructor-nesting fix) by running the
+    original, unmodified logic against the same real text and getting the
+    identical miss. Would need multi-line lookahead (scan forward past the
+    closing `)` of the parameter list for the next non-blank line, rather
+    than only checking one line ahead) — not yet done.
