@@ -558,6 +558,18 @@ class SemanticDB:
             """, (binary, kind, key)).fetchone()
         return row["id"] if row else None
 
+    def get_entity(self, entity_id: int) -> Optional[dict]:
+        with self._conn() as conn:
+            row = conn.execute("SELECT * FROM entities WHERE id = ?", (entity_id,)).fetchone()
+        return dict(row) if row else None
+
+    def get_entities_by_kind(self, binary: str, kind: str) -> list[dict]:
+        with self._conn() as conn:
+            rows = conn.execute("""
+                SELECT * FROM entities WHERE binary = ? AND kind = ?
+            """, (binary, kind)).fetchall()
+        return [dict(r) for r in rows]
+
     def record_fact(self, entity_id: int, fact_type: str, value: str,
                      confidence: float, evidence: Optional[list] = None,
                      source_pass: Optional[int] = None, provider: str = "") -> int:

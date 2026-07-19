@@ -6,6 +6,7 @@ reconstruction incrementally rather than asking the AI to do
 everything at once.
 """
 
+import json
 import re
 
 from config import NUM_PASSES, OLLAMA_MODEL, LLM_PROVIDER
@@ -146,6 +147,66 @@ _TYPE_START_RE = re.compile(
 )
 
 
+def _format_deterministic_facts(facts: list[dict]) -> str:
+    """
+    Render architecture-mission Phase 2's deterministic evidence
+    (analyzer/cfg_builder.py's analyze_deterministic) for one function's
+    entity into prompt-ready text. Pure static analysis, not AI-inferred.
+    """
+    lines = []
+    for f in facts:
+        ftype, value = f["fact_type"], f["value"]
+        if ftype == "calling_convention":
+            lines.append(f"  Calling convention: {value}")
+        elif ftype == "natural_loops":
+            loops = json.loads(value)
+            lines.append(f"  Natural loops detected (dominator-based): {len(loops)}")
+        elif ftype == "propagated_constants":
+            consts = json.loads(value)
+            shown = ", ".join(f"{c['varnode']}={c['value']}" for c in consts[:10])
+            lines.append(f"  Propagated constants ({len(consts)} total): {shown}")
+        elif ftype == "alias_hints":
+            alias = json.loads(value)
+            if alias.get("distinct_stack_locals"):
+                lines.append("  Guaranteed-distinct stack locals: "
+                              + ", ".join(alias["distinct_stack_locals"]))
+            if alias.get("distinct_alloc_call_sites"):
+                lines.append(f"  Distinct heap allocation call sites: "
+                              f"{alias['distinct_alloc_call_sites']}")
+    return "\n".join(lines)
+
+
+def _format_library_hints(db: SemanticDB, entity_id: int) -> str:
+    """
+    Render architecture-mission Phase 2's STL/library detections
+    (analyzer/library_signatures.py) this function references, via the
+    knowledge-graph `references` relationships recorded in main.py's seed step.
+    """
+    lines = []
+    for rel in db.get_relationships(entity_id, direction="out", rel_type="references"):
+        type_entity = db.get_entity(rel["dst_entity_id"])
+        if not type_entity:
+            continue
+        fact = db.get_current_fact(rel["dst_entity_id"], "library")
+        library = fact["value"] if fact else "?"
+        lines.append(f"  {type_entity['key']} (library: {library}) — "
+                      f"use the real type, do not reinvent its internals.")
+    return "\n".join(lines)
+
+
+def _format_whole_program_context(db: SemanticDB, binary_name: str) -> str:
+    """
+    Known types/classes already identified elsewhere in this binary — not
+    just this function's own direct callers/callees (mission item #1,
+    "whole-program reconstruction").
+    """
+    entities = db.get_entities_by_kind(binary_name, "type")
+    keys = sorted({e["key"] for e in entities})
+    if not keys:
+        return ""
+    return "Known types/classes already identified elsewhere in this binary:\n  " + ", ".join(keys[:30])
+
+
 def _matching_brace(code: str, open_pos: int):
     """Index of the `}` that closes the `{` at `open_pos`, or None if unbalanced."""
     depth = 0
@@ -236,6 +297,20 @@ class MultiPassTranslator:
         caller_summaries = self.db.get_caller_summaries(self.binary_name, name)
         callees = function_data.get("callees", [])
 
+        # Architecture-mission Phase 3: evidence-based, whole-program-aware
+        # prompting. Pulls from the knowledge graph populated in Phase 1/2 —
+        # purely additive prompt CONTENT, no change to the pass loop, name
+        # lock, or callee guard below.
+        entity_id = self.db.get_entity_id(self.binary_name, "function", address)
+        deterministic_evidence = (
+            _format_deterministic_facts(self.db.get_entity_facts(entity_id))
+            if entity_id else ""
+        )
+        library_hints = (
+            _format_library_hints(self.db, entity_id) if entity_id else ""
+        )
+        whole_program_context = _format_whole_program_context(self.db, self.binary_name)
+
         for pass_num in range(start_pass, self.num_passes + 1):
             prev_code = current_code
 
@@ -251,6 +326,9 @@ class MultiPassTranslator:
                 recovered_types=recovered_types,
                 api_context=api_context,
                 ai_name=ai_name,
+                deterministic_evidence=deterministic_evidence,
+                library_hints=library_hints,
+                whole_program_context=whole_program_context,
             )
 
             new_code = _call_llm(self._llm, system, user, pass_num)

@@ -45,15 +45,40 @@ narrated per-phase in `BUILD_PROGRESS.md`.
   candidate at depth 0); verified against the real leaked case, the 6
   clean functions from the same run, and real legitimate standalone
   destructor translations already in the DB (no regression). Also found —
-  but deliberately left unfixed, out of scope for what was asked — a
-  separate, pre-existing, unrelated limitation: multi-line signatures
-  (2+ lines before the opening brace) aren't detected at all, so some
-  real in-body renames never reach `function_index.txt`/the banner.
-- **Phases 3-8 — not started.** Evidence-based whole-program prompting, a
-  validation layer, confidence-gated overwrite + contradiction detection,
-  the iterative refinement loop, semantic checkpoints/quality metrics, and
-  `output/writer.py` catching up to the graph. Sequenced risk-ascending;
-  each phase requires a separate go-ahead before starting.
+  but deliberately left unfixed at the time, out of scope for what was
+  asked — a separate, pre-existing, unrelated limitation: multi-line
+  signatures (2+ lines before the opening brace) aren't detected at all,
+  so some real in-body renames never reach `function_index.txt`/the banner.
+- **Multi-line-signature fix — done (BUILD_PROGRESS.md, session 25).**
+  Fixed the limitation just above. While verifying it, ran a much broader
+  sweep (all 100 real completed translations, not just the 7-function test
+  set) and found a genuine, unresolved tension in session 24's own
+  depth-tracking fix: pass 4 legitimately nests a real, substantive answer
+  inside a class skeleton by design (its own system prompt asks for this),
+  so "nested = leaked" isn't reliably true. Two real regressions confirmed
+  (a string constructor's genuine nested answer lost in favor of an
+  unrelated depth-0 helper function; a `Draw`→`Render` nested method lost
+  the same way). No simple structural heuristic (depth, body-emptiness, or
+  a combination) resolves both directions — the real fix needs to
+  cross-reference a candidate against the original Ghidra signature, which
+  is materially bigger than a name-extraction tweak. Deliberately left
+  unpatched rather than trade one set of bugs for another; logged as
+  known-edge-case #11, explicitly deferred to Phase 4's validation layer.
+- **Phase 3 — done (BUILD_PROGRESS.md, session 26).** Evidence-based,
+  whole-program-aware prompting: `ai/prompts.py` gained three new sections
+  (deterministic evidence, known-library hints, whole-program type
+  context) fed from the Phase 1/2 knowledge graph; `ai/translator.py`
+  fetches and threads them through every pass. Purely additive prompt
+  content — the linear pass loop, name-lock, and callee guard are
+  unchanged. Verified against real `entity_facts`/`relationships` already
+  in `semantic.db`, and by running the actual `translate()` method against
+  a real completed function (resumed cleanly through all 6 passes,
+  exercising the new code with zero exceptions).
+- **Phases 4-8 — not started.** A validation layer, confidence-gated
+  overwrite + contradiction detection, the iterative refinement loop,
+  semantic checkpoints/quality metrics, and `output/writer.py` catching up
+  to the graph. Sequenced risk-ascending; each phase requires a separate
+  go-ahead before starting.
 
 ---
 

@@ -93,7 +93,10 @@ def build_user_prompt(pass_num: int, function_data: dict, code: str,
                       caller_summaries: list = None,
                       recovered_types: str = "",
                       api_context: str = "",
-                      ai_name: str = "") -> str:
+                      ai_name: str = "",
+                      deterministic_evidence: str = "",
+                      library_hints: str = "",
+                      whole_program_context: str = "") -> str:
     parts = []
 
     parts.append(f"FUNCTION: {function_data['name']}")
@@ -116,9 +119,31 @@ def build_user_prompt(pass_num: int, function_data: dict, code: str,
         parts.append("\nKNOWN API SIGNATURES:")
         parts.append(api_context)
 
+    # Pure static-analysis facts (analyzer/cfg_builder.py's analyze_deterministic):
+    # calling convention, real dominator-based loops, propagated constants,
+    # alias hints. Ground truth, not a guess — useful through class
+    # reconstruction, less relevant once beautification is the only thing left.
+    if deterministic_evidence and pass_num <= 4:
+        parts.append("\nDETERMINISTIC EVIDENCE (static analysis, not AI-inferred):")
+        parts.append(deterministic_evidence)
+
+    # Best-effort STL/library detections (analyzer/library_signatures.py) —
+    # tells the model "this is a known library type, don't reinvent its
+    # internals from scratch" instead of hallucinating library internals.
+    if library_hints and pass_num >= 3:
+        parts.append("\nKNOWN LIBRARY TYPES REFERENCED:")
+        parts.append(library_hints)
+
     if recovered_types and pass_num >= 3:
         parts.append("\nRECOVERED TYPES FROM OTHER FUNCTIONS:")
         parts.append(recovered_types)
+
+    # Whole-program context: other classes/types already identified
+    # elsewhere in this binary, not just this function's direct callers/
+    # callees — mission item #1, "whole-program reconstruction."
+    if whole_program_context and pass_num >= 3:
+        parts.append("\nWHOLE-PROGRAM CONTEXT:")
+        parts.append(whole_program_context)
 
     # Callee context is useful for naming (pass 2), type inference (pass 3),
     # class reconstruction (pass 4), and consistency (passes 5-6)

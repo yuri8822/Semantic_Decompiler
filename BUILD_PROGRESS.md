@@ -1376,9 +1376,137 @@ Root cause: `has_brace`'s lookahead only checks the *very next* line for
 `{`, but this function's beautified signature spans six lines before its
 opening brace. Confirmed this is **pre-existing**, not caused by this
 session's fix, by running the original (pre-fix) logic against the same
-text and getting the identical fallback result. Left unfixed — out of
-scope for the destructor bug that was actually asked for — and flagged
-for the user to decide on separately.
+text and getting the identical fallback result. Fixed in session 25.
+
+---
+
+## What was built — session 25
+
+Follow-up: fixed the multi-line-signature limitation flagged (but left
+open) at the end of session 24, then went looking for regressions more
+thoroughly than the earlier curated test set — which surfaced a genuine,
+deeper tension in session 24's own depth-tracking fix that's worth
+understanding before trusting it blindly.
+
+### Fix — `ai/translator.py`
+`extract_function_name()`'s single-line lookahead is now a small
+forward-merge: when a candidate line has unbalanced parens (a parameter
+list still open), subsequent lines are merged in (capped at 20 lines, a
+sanity bound) until the parens close, before checking for the opening `{`.
+Brace-depth accounting from session 24 is preserved across the merged span.
+
+### Verification
+- The targeted case now resolves correctly:
+  `__mingw_invalidParameterHandler` → `handle_invalid_parameter`.
+- Re-checked the full existing regression set (the Bishop/leaked-context
+  case, the other 6 clean functions from that run, and the 5 real
+  standalone-destructor cases) — all unchanged.
+- Went further this time: ran both the pre-session-24 and current
+  `extract_function_name()` against **all 100** real completed
+  translations in `semantic.db` (every binary, not just Chess.exe's
+  7-function test run) and diffed every case where the result changed.
+
+### A real, unresolved tension found during that broader sweep
+9 of the 100 real functions changed result. Two are unambiguous fixes:
+`Bishop` → `WinMainCRTStartup` (session 24's own target) and a case where
+the old code grabbed `x` from a one-line accessor (`struct Piece { int
+x() const {...} }`) sitting textually before the real function `Move` —
+depth-tracking correctly prefers `Move`.
+
+But two others are genuine **regressions**, and they reveal *why*
+depth-based rejection isn't a clean fix in general: pass 4's own system
+prompt explicitly instructs the model to "emit a skeleton class definition
+... where evidence supports it," so the model legitimately nests its real,
+substantive answer inside a class wrapper as designed behavior, not as a
+leak. One case: the real function was a `string` constructor, and the
+model's genuine, substantive answer was `class string { public: string(...)
+{ ...real logic... } };` — nested at depth 1. Depth-tracking skips it and
+instead matches a later, depth-0 helper function the model also wrote
+(`static unsigned long long length(...)`), returning `length` — actively
+*more* misleading for a string constructor than the old code's answer
+(`string`). A second case (`Draw` → `Render`, a real, substantive nested
+method calling `Chess::DisplayBoard`) shows the same pattern.
+
+Checked whether a simpler combined heuristic (e.g. "also require a
+non-empty body") resolves both directions — it doesn't: the wrongly-matched
+`Piece::x()` accessor *does* have a real (if trivial) body, so an
+emptiness filter alone lets it back through. The two directions
+(prefer-depth-0 vs. prefer-nested-substantive) are in genuine conflict, and
+no simple structural signal (depth, body-emptiness, or a combination)
+cleanly resolves both — the signal that would actually work is
+cross-referencing a candidate's signature against the *original Ghidra
+signature* (parameter shape), which is a materially bigger change than a
+name-extraction tweak.
+
+### Decision: left as-is, not patched further
+Rather than trade one set of real bugs for another with an unproven quick
+heuristic, the depth-tracking fix from session 24 stays as shipped — on
+balance across the sweep it fixes clear cases and mostly falls back safely
+elsewhere, with two confirmed regressions. Properly disambiguating
+"legitimate nested class reconstruction" from "leaked/injected boilerplate"
+is treated as real, open work for the planned Phase 4 validation layer
+(which will have access to more structured evidence to make this call),
+not a same-day patch. Logged as known-edge-case #11.
+
+---
+
+## What was built — session 26
+
+Architecture-mission Phase 3: evidence-based, whole-program-aware
+prompting (mission items #1 and #6). Wires the knowledge graph populated
+in Phases 1-2 into the actual prompts for the first time — purely
+additive prompt *content*; the linear 1-6 pass loop, name-lock, and callee
+guard are all untouched.
+
+### `analyzer/types_db.py`
+Two small lookups needed to resolve graph data for prompts: `get_entity(entity_id)`
+(reverse lookup by id — only `get_entity_id(binary, kind, key)` existed
+before) and `get_entities_by_kind(binary, kind)` (all entities of one kind
+in a binary, e.g. every detected `type`).
+
+### `ai/translator.py`
+Three new formatting helpers, run once per function before the pass loop:
+- `_format_deterministic_facts()` — renders Phase 2's `entity_facts`
+  (calling convention, natural loops, propagated constants, alias hints)
+  into prompt text.
+- `_format_library_hints()` — walks this function's `references`
+  relationships to STL `type` entities and renders "use the real type,
+  don't reinvent its internals" hints.
+- `_format_whole_program_context()` — lists every `type`-kind entity
+  known anywhere in the binary, not just this function's direct
+  callers/callees.
+
+`translate()` now computes all three (via the function's own entity,
+looked up by `binary + address`) right after fetching the existing
+`recovered_types`/`callee_summaries`/`caller_summaries` context, and
+threads them into every `build_user_prompt()` call in the pass loop.
+
+### `ai/prompts.py`
+`build_user_prompt()` gained three new optional sections: `DETERMINISTIC
+EVIDENCE` (pass ≤4 — most useful through class reconstruction, less
+relevant once only beautification remains), `KNOWN LIBRARY TYPES
+REFERENCED` and `WHOLE-PROGRAM CONTEXT` (both pass ≥3, matching
+`RECOVERED TYPES FROM OTHER FUNCTIONS`'s existing gating).
+
+### Verification against real data
+- Ran all three formatting helpers directly against the real `entity_facts`/
+  `relationships` already sitting in `semantic.db` from the earlier
+  Chess.exe run (87 real facts, real `references` relationships to
+  `std::allocator`/`std::basic_string`) — all render correctly. (One early
+  scare: a formatted string's em-dash printed as `�` in the console;
+  confirmed via `hex(ord(ch))` that the actual stored character is the
+  correct `U+2014` — purely a console rendering artifact, not real data
+  corruption.)
+- Assembled a full real pass-4 prompt end-to-end via `build_user_prompt()`
+  with real evidence/hints/context strings — output is well-formed.
+- Ran the actual `MultiPassTranslator.translate()` method (not a
+  reimplementation) against a real, already-fully-completed Chess.exe
+  function. It correctly resumed straight through all 6 passes (0 loop
+  iterations), which meant the new entity-lookup and all three formatting
+  calls executed for real, unconditionally, with zero exceptions, before
+  ever reaching the (unrelated, pre-existing) final summary step — which
+  failed only because no live Bonsai server is running right now, nothing
+  to do with this session's changes.
 
 ---
 
@@ -1487,18 +1615,37 @@ for the user to decide on separately.
    completed translations in `semantic.db` were produced against the old,
    garbled context and aren't automatically redone.
 
-10. **`extract_function_name()`'s `has_brace` lookahead only checks one
-    line ahead (found in session 24, not fixed)** — a function whose
-    signature spans more than two lines (common after pass 6
-    beautification reformats a multi-parameter signature onto separate
-    lines) never has its opening `{` detected, so a real in-body rename
-    goes undetected and `function_index.txt`/the recovered.cpp banner keep
-    showing the original Ghidra name even though the code itself was
-    renamed. Confirmed real: `__mingw_invalidParameterHandler` was renamed
-    to `handle_invalid_parameter` in its own function body, but the banner
-    still reads `__mingw_invalidParameterHandler`. Confirmed pre-existing
-    (not introduced by session 24's destructor-nesting fix) by running the
-    original, unmodified logic against the same real text and getting the
-    identical miss. Would need multi-line lookahead (scan forward past the
-    closing `)` of the parameter list for the next non-blank line, rather
-    than only checking one line ahead) — not yet done.
+10. ~~`extract_function_name()`'s `has_brace` lookahead only checks one
+    line ahead~~ **Fixed in session 25.** A function whose signature spans
+    more than two lines (common after pass 6 beautification reformats a
+    multi-parameter signature onto separate lines) never had its opening
+    `{` detected, so a real in-body rename went undetected and
+    `function_index.txt`/the recovered.cpp banner kept showing the
+    original Ghidra name even though the code itself was renamed. Fixed by
+    merging continuation lines while a parameter list is still open,
+    before checking for `{`. See session 25.
+
+11. **Depth-tracking (session 24's destructor-nesting fix) can miss or
+    mis-pick a name when the model's real, substantive answer is
+    legitimately nested inside a class wrapper (found in session 25, not
+    fixed)** — pass 4's system prompt explicitly asks the model to wrap a
+    reconstructed function in a class skeleton "where evidence supports
+    it," so nesting isn't reliably a leak signal. Confirmed two real
+    regressions from requiring depth 0: a `string` constructor's genuine,
+    substantive nested answer (`class string { public: string(...) {
+    ...real logic... } };`) gets skipped in favor of a later, unrelated,
+    depth-0 helper function the model also wrote (`length`) — actively
+    more misleading than the pre-session-24 result (`string`). A second
+    case (`Draw`→`Render`, a real nested method with substantive logic)
+    shows the same pattern. Tried an emptiness-filter (reject only
+    stub/empty bodies) as a possible combined fix — doesn't work either,
+    since a wrongly-matched one-line accessor (`int x() const { return
+    *(int*)this; }`) has a real, non-empty body too. No simple structural
+    signal (depth, emptiness, or a combination) reliably resolves both
+    directions; the signal that would actually work is cross-referencing a
+    candidate against the *original Ghidra signature* (parameter shape),
+    which is materially bigger than a name-extraction tweak. Deliberately
+    left unpatched rather than trading one set of bugs for another with an
+    unproven quick heuristic — treated as real work for the planned Phase 4
+    validation layer, which will have more structured evidence to make this
+    call properly.
