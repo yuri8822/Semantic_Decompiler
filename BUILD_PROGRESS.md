@@ -1653,6 +1653,100 @@ but not literally unfalsifiable" behavior.
 
 ---
 
+## What was built — session 29
+
+Architecture-mission Phase 6: the iterative refinement loop (mission item
+#4) — the highest-risk phase in the plan, since it's the first one to
+change the pass loop's actual control flow rather than prompt content
+(Phase 3), accept/reject logic (Phase 4), or storage semantics (Phase 5).
+
+### Scope decision, stated upfront
+Full whole-program simultaneous iteration (a cross-function invalidation
+queue) was deliberately not built this session — the plan's own design
+review anticipated exactly this: "start with per-function iterate-until-
+stable... only later expand to cross-function propagation." What ships
+here is genuine **per-function** iteration between typing (pass 3) and
+class reconstruction (pass 4); cross-function propagation still happens,
+but "for free" via the architecture that already existed before this
+phase — `recovered_types`/`get_types_for_context()` is a binary-wide
+shared table, so a function processed later in the same run already sees
+everything discovered by earlier functions. Naming (pass 2) is
+deliberately **not** reopened by this loop — the name-lock mechanism is a
+separately hardened, load-bearing invariant, and reopening it wasn't this
+phase's own goal (typing ↔ class-recon feedback).
+
+### `ai/translator.py`
+- Extracted `_run_pass()`: the per-pass build-prompt → call LLM → validate
+  (Phase 4) → retry-once-with-feedback → persist logic, previously inline
+  in the main loop only, now shared by the initial linear loop and the new
+  refinement rounds.
+- New `_extract_type_names()`: same brace-depth-matched, complete-
+  definition-only detection as `_harvest_types`, but returns just the set
+  of names — used to answer "did class reconstruction discover anything
+  type inference didn't have."
+- After the initial linear 1‑N pass sequence, a bounded loop (up to
+  `MAX_REFINEMENT_ROUNDS`, new in `config.py`, default 3): compares the
+  type names in the *stored* pass-3 output against pass-4's — if pass 4
+  surfaced genuinely new struct/class/enum definitions, that's real
+  evidence pass 3 didn't have when it ran, so re-run passes 3 then 4 with
+  the newly-harvested type context and check again. Converges when a
+  round surfaces nothing new, or a round runs but produces no actual code
+  change, or the round cap is hit. If any round actually ran, passes 5-6
+  are reapplied afterward so consistency/beautification aren't left stale
+  relative to the refined content.
+- `refinement_round` is persisted after every round (new `functions`
+  column, `analyzer/types_db.py`), so a resumed run picks up exactly where
+  it left off rather than restarting the check from zero — and
+  `clear_pass_data()` now also resets it, so a provider switch can't
+  inherit a stale round count from a different provider's earlier work.
+
+### A real bug found via testing, fixed before shipping
+Initial implementation used `refinement_round > 0` to decide whether to
+reapply passes 5-6 after the loop — but that's the *persisted historical*
+count, not whether refinement actually happened *in this call*. A resumed
+function that already had `refinement_round=1` from a prior completed run
+would unconditionally reapply 5-6 on every subsequent resume, even when
+this call's own refinement check immediately converged with zero new
+rounds. Fixed by tracking a separate `refined_this_call` flag, set only
+when a round actually completes during the current invocation.
+
+### Verification
+- **Scenario A (no-regression baseline)**: a function where pass 4
+  introduces nothing pass 3 didn't have — confirmed the exact same call
+  sequence as before this phase existed (1‑2‑3‑4‑5‑6, no extra calls),
+  `refinement_round` stays 0.
+- **Scenario B (real trigger, converges, reapplies)**: pass 4 introduces a
+  genuine new type; confirmed exactly one refinement round fires, passes
+  3‑4 re-run with the new context, convergence is detected correctly once
+  pass 3 also reflects it, and passes 5‑6 are correctly reapplied
+  afterward — verified the exact call sequence, not just the end state.
+- **Scenario C (pathological, never converges)**: a mock that introduces
+  a genuinely new, distinct type on every single round — confirmed the
+  loop stops exactly at `MAX_REFINEMENT_ROUNDS` (not one more, not one
+  less) instead of running forever.
+- **Scenario D (resume)**: a function with `refinement_round=1` already
+  persisted and converged pass-3/pass-4 content from a prior "run" —
+  confirmed a resumed call makes **zero** extra LLM calls (this is the
+  test that caught the `refined_this_call` bug above, before the fix it
+  wrongly reapplied 5‑6).
+- **Real-data integration** (not just mocks): re-ran the actual
+  `translate()` method against a genuinely already-completed real
+  Chess.exe function (`__mingw_invalidParameterHandler`), with a
+  deliberately dumb stubbed LLM (returns a fixed non-code string for every
+  call). This real row turned out to already have the same kind of
+  leaked-type-context pollution documented in sessions 24-25 (pass 4
+  contains 8 stray type names — `Bishop`, `Engine`, `Pawn`, etc. — pass 3
+  doesn't have), so the refinement trigger correctly fired for real,
+  attempted to re-run passes 3‑4 and then 5‑6, got garbage back from the
+  stub every time, and Phase 4's validation layer correctly rejected and
+  reverted every single attempt (all "return statements removed"
+  rejections). Confirmed the function's real, original content (1343
+  chars, `handle_invalid_parameter` intact) survived completely unchanged
+  — a genuine demonstration that Phase 4 and Phase 6 compose safely even
+  against a maximally uncooperative LLM, not just against clean mocks.
+
+---
+
 ## Known limitations / next steps
 
 ### Still to build

@@ -115,6 +115,10 @@ class SemanticDB:
         "pass6_output": "TEXT    DEFAULT ''",
         "final_cpp":    "TEXT    DEFAULT ''",
         "analyzed_at":  "TEXT    DEFAULT (datetime('now'))",
+        # Architecture-mission Phase 6: how many bounded refinement rounds
+        # (typing <-> class-recon) have completed for this function, so a
+        # resumed run picks up mid-refinement rather than restarting it.
+        "refinement_round": "INTEGER NOT NULL DEFAULT 0",
     }
 
     def __init__(self, db_path: str):
@@ -382,22 +386,30 @@ class SemanticDB:
 
     def clear_pass_data(self, binary: str, address: str):
         """
-        Wipe all pass outputs, final_cpp, ai_name, and summary for a
-        function. Used when switching providers, so stale results from a
-        different provider can never be left dangling under the new
-        provider's marker — otherwise an interruption right after the
-        switch (before the new provider has produced anything) would let
-        old, unmigrated data masquerade as "complete" under the new
-        provider on a later resumed run.
+        Wipe all pass outputs, final_cpp, ai_name, summary, and the
+        refinement-round counter for a function. Used when switching
+        providers, so stale results from a different provider can never be
+        left dangling under the new provider's marker — otherwise an
+        interruption right after the switch (before the new provider has
+        produced anything) would let old, unmigrated data masquerade as
+        "complete" under the new provider on a later resumed run. Also
+        resets refinement_round — a different provider's earlier round
+        count has no bearing on this provider's fresh attempt.
         """
         with self._conn() as conn:
             conn.execute("""
                 UPDATE functions SET
                     pass1_output = '', pass2_output = '', pass3_output = '',
                     pass4_output = '', pass5_output = '', pass6_output = '',
-                    final_cpp = '', ai_name = '', summary = ''
+                    final_cpp = '', ai_name = '', summary = '', refinement_round = 0
                 WHERE binary = ? AND address = ?
             """, (binary, address))
+
+    def set_refinement_round(self, binary: str, address: str, round_num: int):
+        with self._conn() as conn:
+            conn.execute("""
+                UPDATE functions SET refinement_round = ? WHERE binary = ? AND address = ?
+            """, (round_num, binary, address))
 
     def is_complete_for_provider(self, binary: str, address: str, provider: str) -> bool:
         """

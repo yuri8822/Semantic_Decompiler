@@ -60,6 +60,15 @@ OUTPUT_WRITE_EVERY_SECONDS = 30
 
 # --- Pipeline ---
 NUM_PASSES = 6
+
+# Architecture-mission Phase 6: bounded iterative refinement. After the
+# initial linear 1..N pass sequence, typing (pass 3) and class
+# reconstruction (pass 4) may re-run against each other up to this many
+# extra rounds if class reconstruction surfaces genuinely new type/class
+# definitions type inference didn't have when it ran. A hard backstop
+# against a pathological pair of passes re-triggering each other forever —
+# most functions converge (or need nothing) in 0-1 rounds.
+MAX_REFINEMENT_ROUNDS = 3
 PASS_NAMES = [
     "cleanup",           # Pass 1: structural cleanup
     "renaming",          # Pass 2: variable/function renaming

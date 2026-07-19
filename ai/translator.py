@@ -10,7 +10,7 @@ import json
 import re
 from dataclasses import dataclass, field
 
-from config import NUM_PASSES, OLLAMA_MODEL, LLM_PROVIDER
+from config import NUM_PASSES, OLLAMA_MODEL, LLM_PROVIDER, MAX_REFINEMENT_ROUNDS
 from ai.llm_client import LLMClient
 from ai.prompts import SYSTEMS, build_user_prompt
 from analyzer.types_db import SemanticDB
@@ -347,6 +347,26 @@ def _matching_brace(code: str, open_pos: int):
     return None
 
 
+def _extract_type_names(code: str) -> set:
+    """
+    Set of struct/class/enum names *completely defined* in code — same
+    brace-depth-matched, complete-definition-only detection as
+    `_harvest_types` (architecture-mission Phase 6 uses this to compare
+    "what type inference knew" vs. "what class reconstruction added").
+    """
+    names = set()
+    for m in _TYPE_START_RE.finditer(code or ""):
+        open_brace = m.end() - 1
+        close_brace = _matching_brace(code, open_brace)
+        if close_brace is None:
+            continue
+        tail = re.match(r'\s*;', code[close_brace + 1: close_brace + 21])
+        if not tail:
+            continue
+        names.add(m.group(2))
+    return names
+
+
 class MultiPassTranslator:
     def __init__(self, db: SemanticDB, binary_name: str, num_passes: int = NUM_PASSES,
                  provider: str = LLM_PROVIDER, ollama_model: str = OLLAMA_MODEL,
@@ -438,60 +458,23 @@ class MultiPassTranslator:
         )
         whole_program_context = _format_whole_program_context(self.db, self.binary_name)
 
-        for pass_num in range(start_pass, self.num_passes + 1):
-            prev_code = current_code
-
-            system = SYSTEMS[pass_num]
-            user = build_user_prompt(
-                pass_num=pass_num,
-                function_data=function_data,
-                code=current_code,
-                ir=ir,
-                cfg_summary=cfg_summary,
-                callee_summaries=callee_summaries,
-                caller_summaries=caller_summaries,
-                recovered_types=recovered_types,
-                api_context=api_context,
-                ai_name=ai_name,
-                deterministic_evidence=deterministic_evidence,
-                library_hints=library_hints,
+        # Bundles everything _run_pass needs to build a prompt, so both the
+        # initial linear loop and the Phase 6 refinement rounds below call
+        # it identically. ai_name/recovered_types are mutable across the
+        # call (name-lock capture, freshly-harvested types), so they're
+        # read from `self`-less locals at call time, not frozen here.
+        def _ctx():
+            return dict(
+                function_data=function_data, ir=ir,
+                callee_summaries=callee_summaries, caller_summaries=caller_summaries,
+                recovered_types=recovered_types, api_context=api_context, ai_name=ai_name,
+                deterministic_evidence=deterministic_evidence, library_hints=library_hints,
                 whole_program_context=whole_program_context,
             )
 
-            new_code = _call_llm(self._llm, system, user, pass_num)
-
-            # Validation layer (architecture-mission Phase 4): run every
-            # cheap correctness check (includes the original callee guard).
-            # On failure, one bounded retry with explicit feedback about
-            # what was wrong, restarting from prev_code (never compounding
-            # on the rejected output); if the retry also fails, fall back
-            # to the original revert-to-prev_code behavior.
-            locked_name = ai_name or name
-            result = validate_transition(prev_code, new_code, callees, locked_name, cfg_summary, pass_num)
-
-            if not result.accepted:
-                print(f"[translator] Pass {pass_num} rejected for {name}: "
-                      f"{'; '.join(result.reasons)} — retrying once with feedback")
-                feedback = (
-                    "\n\nVALIDATION FAILURE — your previous attempt was rejected for:\n"
-                    + "\n".join(f"  - {r}" for r in result.reasons)
-                    + "\nRegenerate from the CODE TO PROCESS above, preserving everything "
-                      "the failure(s) above call out. Do not repeat the same mistake."
-                )
-                retry_code = _call_llm(self._llm, system, user + feedback, pass_num)
-                retry_result = validate_transition(prev_code, retry_code, callees, locked_name, cfg_summary, pass_num)
-                if retry_result.accepted:
-                    new_code, result = retry_code, retry_result
-                else:
-                    print(f"[translator] Pass {pass_num} retry also rejected for {name}: "
-                          f"{'; '.join(retry_result.reasons)} — reverting to previous pass's output")
-                    new_code = prev_code  # fall back to the pre-existing revert behavior
-
-            if result.warnings:
-                print(f"[translator] Pass {pass_num} warning for {name}: {'; '.join(result.warnings)}")
-
-            current_code = new_code
-            self.db.set_pass_output(self.binary_name, address, pass_num, current_code)
+        for pass_num in range(start_pass, self.num_passes + 1):
+            current_code = self._run_pass(pass_num, current_code, callees, cfg_summary,
+                                           address, name, **_ctx())
 
             # Fix 2 — name lock: after pass 2 (renaming), capture the AI's chosen
             # function name and store it so later passes can't silently revert it.
@@ -505,6 +488,54 @@ class MultiPassTranslator:
                 self._harvest_types(current_code, address)
                 recovered_types = self.db.get_types_for_context()
 
+        # Architecture-mission Phase 6: bounded iterative refinement.
+        # Typing (pass 3) and class reconstruction (pass 4) mutually inform
+        # each other — the strict linear order above runs each exactly
+        # once, so if class reconstruction surfaces a genuinely new
+        # struct/class/enum definition that type inference didn't have
+        # when IT ran, that discovery is otherwise thrown away rather than
+        # fed back. Naming (pass 2) is deliberately NOT reopened here — the
+        # name-lock mechanism is a separately hardened, load-bearing
+        # invariant this project depends on, and reopening it isn't what
+        # this feedback loop is about.
+        refinement_round = (existing.get("refinement_round") or 0) if same_provider else 0
+        refined_this_call = False  # distinct from refinement_round>0, which may just be resumed history
+        if self.num_passes >= 4:
+            while refinement_round < MAX_REFINEMENT_ROUNDS:
+                pass3_types = _extract_type_names(self.db.get_pass_output(self.binary_name, address, 3))
+                pass4_types = _extract_type_names(self.db.get_pass_output(self.binary_name, address, 4))
+                new_types = pass4_types - pass3_types
+                if not new_types:
+                    break  # class-recon surfaced nothing type inference didn't already know
+
+                print(f"[translator] Refinement round {refinement_round + 1} for {name}: "
+                      f"class reconstruction surfaced new type(s) {sorted(new_types)} not seen "
+                      f"by type inference — re-running passes 3-4")
+
+                code_before_round = current_code
+                for dim_pass in (3, 4):
+                    current_code = self._run_pass(dim_pass, current_code, callees, cfg_summary,
+                                                   address, name, **_ctx())
+                    if dim_pass == 3:
+                        self._harvest_types(current_code, address)
+                        recovered_types = self.db.get_types_for_context()
+
+                refinement_round += 1
+                refined_this_call = True
+                self.db.set_refinement_round(self.binary_name, address, refinement_round)
+
+                if current_code == code_before_round:
+                    break  # the round ran but changed nothing — also converged
+
+            if refined_this_call and self.num_passes >= 5:
+                # Refined typing/class content may have left the earlier
+                # consistency/beautification passes stale relative to it —
+                # reapply them so the shipped output reflects the refinement.
+                print(f"[translator] Reapplying consistency/beautification for {name} after refinement")
+                for final_pass in range(5, self.num_passes + 1):
+                    current_code = self._run_pass(final_pass, current_code, callees, cfg_summary,
+                                                   address, name, **_ctx())
+
         self.db.set_final_cpp(self.binary_name, address, current_code)
 
         # Generate a one-line summary for the call-graph context of other functions
@@ -517,6 +548,66 @@ class MultiPassTranslator:
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
+
+    def _run_pass(self, pass_num: int, current_code: str, callees: list, cfg_summary: str,
+                   address: str, name: str, function_data: dict, ir: str,
+                   callee_summaries: list, caller_summaries: list, recovered_types: str,
+                   api_context: str, ai_name: str, deterministic_evidence: str,
+                   library_hints: str, whole_program_context: str) -> str:
+        """
+        Runs one pass: build its prompt, call the LLM, validate the
+        transition (Phase 4) with one bounded retry-with-feedback on
+        failure, persist the pass output. Shared by the initial linear
+        loop and the Phase 6 refinement rounds so both go through
+        identical validation/retry/persistence — extracted from what used
+        to be inline in the main loop only.
+        """
+        prev_code = current_code
+        system = SYSTEMS[pass_num]
+        user = build_user_prompt(
+            pass_num=pass_num,
+            function_data=function_data,
+            code=current_code,
+            ir=ir,
+            cfg_summary=cfg_summary,
+            callee_summaries=callee_summaries,
+            caller_summaries=caller_summaries,
+            recovered_types=recovered_types,
+            api_context=api_context,
+            ai_name=ai_name,
+            deterministic_evidence=deterministic_evidence,
+            library_hints=library_hints,
+            whole_program_context=whole_program_context,
+        )
+
+        new_code = _call_llm(self._llm, system, user, pass_num)
+
+        locked_name = ai_name or name
+        result = validate_transition(prev_code, new_code, callees, locked_name, cfg_summary, pass_num)
+
+        if not result.accepted:
+            print(f"[translator] Pass {pass_num} rejected for {name}: "
+                  f"{'; '.join(result.reasons)} — retrying once with feedback")
+            feedback = (
+                "\n\nVALIDATION FAILURE — your previous attempt was rejected for:\n"
+                + "\n".join(f"  - {r}" for r in result.reasons)
+                + "\nRegenerate from the CODE TO PROCESS above, preserving everything "
+                  "the failure(s) above call out. Do not repeat the same mistake."
+            )
+            retry_code = _call_llm(self._llm, system, user + feedback, pass_num)
+            retry_result = validate_transition(prev_code, retry_code, callees, locked_name, cfg_summary, pass_num)
+            if retry_result.accepted:
+                new_code, result = retry_code, retry_result
+            else:
+                print(f"[translator] Pass {pass_num} retry also rejected for {name}: "
+                      f"{'; '.join(retry_result.reasons)} — reverting to previous pass's output")
+                new_code = prev_code  # fall back to the pre-existing revert behavior
+
+        if result.warnings:
+            print(f"[translator] Pass {pass_num} warning for {name}: {'; '.join(result.warnings)}")
+
+        self.db.set_pass_output(self.binary_name, address, pass_num, new_code)
+        return new_code
 
     def _harvest_types(self, code: str, source_addr: str):
         """

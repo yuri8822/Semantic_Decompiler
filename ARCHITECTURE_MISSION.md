@@ -101,10 +101,28 @@ narrated per-phase in `BUILD_PROGRESS.md`.
   revert cases pulled from `semantic.db` (both correctly logged as
   contradictions, with no flip-flopping under equal evidence strength) and
   confirmed a well-corroborated correction does override a weak one.
-- **Phases 6-8 — not started.** The iterative refinement loop, semantic
-  checkpoints/quality metrics, and `output/writer.py` catching up to the
-  graph. Sequenced risk-ascending; each phase requires a separate go-ahead
-  before starting.
+- **Phase 6 — done (BUILD_PROGRESS.md, session 29).** The iterative
+  refinement loop — the highest-risk phase, since it's the first to change
+  the pass loop's control flow rather than prompt content/accept-reject/
+  storage semantics. Scoped deliberately to genuine **per-function**
+  iteration between typing (pass 3) and class reconstruction (pass 4),
+  bounded by `MAX_REFINEMENT_ROUNDS`; full cross-function invalidation
+  wasn't built (matches the design review's own "start per-function,
+  expand later" guidance) — cross-function propagation still happens for
+  free via the pre-existing binary-wide `recovered_types` table. Naming
+  (pass 2) deliberately not reopened. Found and fixed a real resume bug
+  (reapplying beautification based on persisted round-count history rather
+  than whether refinement happened in the current call) via a 4-scenario
+  test suite (no-regression baseline, real trigger + convergence,
+  pathological non-convergence capped correctly, resume making zero extra
+  calls), plus a real-data integration test against an already-completed
+  Chess.exe function with a deliberately broken stub LLM — confirmed
+  Phase 4's validation layer protects the function's real content even
+  when Phase 6's refinement trigger fires for real against genuinely
+  messy historical data.
+- **Phases 7-8 — not started.** Semantic checkpoints/quality metrics, and
+  `output/writer.py` catching up to the graph. Sequenced risk-ascending;
+  each phase requires a separate go-ahead before starting.
 
 ---
 
