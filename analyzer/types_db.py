@@ -453,6 +453,14 @@ class SemanticDB:
                 [(name, sig, desc) for name, (sig, desc) in apis.items()],
             )
 
+    def tag_known_api_libraries(self, tags: dict):
+        """Bulk-update known_apis.library from a {name: library} mapping (Phase 2)."""
+        with self._conn() as conn:
+            conn.executemany(
+                "UPDATE known_apis SET library = ? WHERE name = ?",
+                [(library, name) for name, library in tags.items()],
+            )
+
     def get_api_context(self, import_names: list[str]) -> str:
         """
         Return a formatted block of known signatures for the given import names.

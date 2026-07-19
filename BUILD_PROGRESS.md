@@ -1136,7 +1136,7 @@ doesn't yet switch anything over to reading from it.
   classpath — verified instead by actually running it through
   `analyzeHeadless`, which is a stronger check than a syntax read anyway.
 
-### Remaining phases (not started)
+### Remaining phases at the time (session 21)
 Deterministic evidence generation (real dominator/loop analysis, bounded
 constant propagation, library/STL signature detection), evidence-based
 whole-program prompting, a generalized validation layer, confidence-gated
@@ -1144,6 +1144,115 @@ overwrite + contradiction detection, the iterative refinement loop
 (replacing the strict linear 1-6 pass order), semantic checkpoints/quality
 metrics, and `output/writer.py` catching up to the graph. Sequenced
 deliberately risk-ascending — see the plan file for the full reasoning.
+
+---
+
+## What was built — session 22
+
+Architecture-mission Phase 2: deterministic evidence generation (mission
+items #5 "AI should do less" and #16 "recover libraries first"). Pure
+static-analysis facts written as side data — nothing downstream reads any
+of it yet, same "zero behavior change" bar as session 21.
+
+### `analyzer/cfg_builder.py`
+Added, alongside the existing `build_cfg_summary()` (left completely
+untouched — verified byte-identical before/after, see below):
+- `compute_natural_loops()` — real dominator-based natural-loop detection
+  (`nx.immediate_dominators` + standard back-edge/body construction), a
+  genuine upgrade over `build_cfg_summary`'s existing `nx.simple_cycles`
+  elementary-cycle counting for anything evidence-grade (header + back-edge
+  + body size, not just "N cycles exist").
+- `compute_constant_facts()` — bounded, intraprocedural constant
+  propagation over the function's own p-code. Explicitly not symbolic
+  execution: Ghidra's high p-code is already SSA (each varnode has exactly
+  one defining op), so propagating a literal through a COPY chain or
+  folding simple arithmetic once both operands are already constant needs
+  no dominance/merge/path reasoning — a single forward linear pass.
+- `extract_calling_convention()` — deterministic regex pull from Ghidra's
+  own signature string (`__cdecl`/`__stdcall`/etc.), not a guess.
+- `compute_alias_hints()` — partial pointer-aliasing heuristic: distinct
+  Ghidra-named stack locals and distinct malloc/`operator new` call sites
+  are guaranteed-distinct storage. Not general alias analysis — only
+  records what's *guaranteed distinct*, never a claim about what aliases.
+- `analyze_deterministic()` — the single entry point tying the above
+  together into `{fact_type, value, evidence}` dicts, kept DB-agnostic like
+  the rest of this module.
+
+### `analyzer/library_signatures.py` (new file)
+- `detect_library_types()` — pattern-matches recognizable STL fragments
+  (already-demangled or partially-demangled: `std::vector`, `_Alloc_hider`,
+  etc., plus a lower-confidence fallback for structurally-mangled-but-
+  unrecognized Itanium/MSVC `std::` symbols) against a function's name and
+  decompiled text. Not a real demangler — tuned to avoid false positives
+  (specific fragments only, never a bare "std" substring) over catching
+  every case.
+- `classify_known_apis()` — tags every `KNOWN_APIS` entry as `"win32"` or
+  `"crt"` via a naming-convention heuristic (PascalCase vs. lower_snake/
+  `__`-prefixed), populating the `known_apis.library` column added in
+  session 21, without hand-maintaining a duplicate list.
+
+### `analyzer/types_db.py`
+Added `tag_known_api_libraries()` — bulk `known_apis.library` update from a
+`{name: library}` mapping.
+
+### `main.py`
+The Step 3 seed loop now also calls `analyze_deterministic()` and
+`detect_library_types()` per function, recording facts via
+`record_facts_batch()`/`record_fact()` (confidence 0.9, `provider="deterministic"`),
+creating `type` entities for detected libraries and a `references`
+relationship from the function to them. Also tags `known_apis.library`
+once via `classify_known_apis()`. `build_cfg_summary()`/`build_ir()` calls
+in Step 4 are completely unchanged.
+
+### A real bug found and fixed — in this session's own new code
+Copied `ir_builder.py`'s `_VARNODE_RE` (`\((\w+),(0x...|\d+),(\d+)\)`, no
+whitespace tolerance) into `cfg_builder.py` for the constant-propagation
+pass, then verified it against the real `find.exe` export before trusting
+any result: **0 of 1939 real p-code ops matched** — Ghidra's actual
+`PcodeOpAST.toString()` output puts a space after every comma
+(`"(register, 0x0, 8)"`, not `"(register,0x0,8)"`), which the regex didn't
+allow for. Fixed locally in `cfg_builder.py` by adding `\s*` after each
+comma. Also found and fixed a second, related bug in the same new code:
+splitting a multi-input op's operand list on every comma (mirroring
+`ir_builder.py`'s own approach) shreds each individual varnode's *internal*
+commas too (e.g. `"(ram, 0x140006668, 8)"` → three broken fragments),
+indistinguishable from the top-level `" , "` separator between multiple
+inputs — confirmed against real `MULTIEQUAL` ops, which always have two
+inputs. Fixed by finding complete varnode-shaped substrings directly
+(`_VARNODE_RE.finditer(...)`) instead of splitting first and matching each
+fragment.
+
+**Not fixed, flagged separately, out of this session's scope:** both bugs
+appear to also exist in `ir_builder.py` itself (identical regex, identical
+split logic) — meaning `build_ir()`, which has fed p-code IR into every AI
+prompt for passes ≤3 across this entire project's history, has likely been
+silently mis-parsing every p-code operation since it was written. Confirmed
+the same 0/1939-real-ops match rate against `ir_builder.py`'s unmodified
+`_VARNODE_RE`. This is a pre-existing production bug, not something
+introduced by Phase 2, and touching `ir_builder.py` was outside this
+phase's approved scope (it fixes AI-facing prompt content, not new
+deterministic side-data) — left for the user to decide whether/when to fix.
+
+### Verification against real data (not synthetic-only)
+- Ran `analyze_deterministic()` and `detect_library_types()` over all 27
+  real functions from the `find.exe` export used in session 21 — no
+  exceptions, real natural loops detected (including a 6-back-edge/
+  5-distinct-loop-header function), real constant propagation with a real
+  arithmetic fold (`COPY 0` then `INT_ADD` correctly resolving to `1`),
+  real alias hints (distinct stack locals, distinct `malloc`/`operator new`
+  call sites), and confirmed zero STL hits (correct — `find.exe` is a plain
+  CRT binary) and zero calling-convention hits (confirmed correct
+  separately — this x64 binary's signatures never carry a
+  `__cdecl`/`__stdcall`-style keyword at all, checked directly against real
+  signature strings, so an empty result here is accurate, not a miss).
+- `known_apis.library`: confirmed every seeded row got tagged (`0` left
+  untagged), spot-checked several CRT names classified correctly.
+- **Byte-identical output check**: captured `build_cfg_summary()`'s output
+  for all 27 real functions before touching the DB, ran the full Phase 2
+  seed step, then recomputed `build_cfg_summary()` again — confirmed
+  identical for every function, proving the existing prompt-facing CFG
+  summary (already live in production since before this phase) is
+  unaffected by anything added here.
 
 ---
 
@@ -1232,3 +1341,31 @@ deliberately risk-ascending — see the plan file for the full reasoning.
    untouched by that leak too). Needs a closer look once a clean re-run
    (reasoning off) is available to compare against — worth checking whether
    it's Bonsai-specific or shows up with other providers too.
+
+9. **`ir_builder.py`'s varnode regex likely never matches real p-code text
+   (found in session 22, not yet fixed)** — `_VARNODE_RE` has no whitespace
+   tolerance after the commas inside a `(space,offset,size)` token, but
+   Ghidra's real `PcodeOpAST.toString()` output always includes a space
+   there (`"(register, 0x0, 8)"`). Confirmed directly: **0 of 1939** real
+   p-code ops from a real `find.exe` export matched this regex at all,
+   while a whitespace-tolerant version matched 100% of them. Since
+   `build_ir()` feeds its output into every AI prompt for passes ≤3, this
+   means the "P-CODE IR" context the model has been shown has likely been
+   silently degraded (garbled operands, `"?"` placeholders, or operations
+   misclassified as void) for this entire project's history — not a crash,
+   since `_parse_op` doesn't raise on a non-match, just produces
+   incomplete/wrong output that `build_ir()`'s per-op `try/except` never
+   catches (no exception is thrown). A second, related bug in the same
+   function: splitting a multi-input op's operand list on every comma
+   shreds each varnode's own internal commas too, indistinguishable from
+   the top-level `" , "` separator between multiple inputs (confirmed
+   against real `MULTIEQUAL` ops, which always have two inputs) — so even
+   after fixing the whitespace issue, multi-input ops would still parse
+   incorrectly without also fixing the splitting logic. Both were fixed in
+   `analyzer/cfg_builder.py`'s own (separate, newer) copy of this same
+   parsing logic during session 22, but `ir_builder.py` itself was
+   deliberately left untouched — fixing it changes what the AI has been
+   seeing in every prompt for the whole project, which is a real behavior
+   change to the already-shipping pipeline and outside the scope of what
+   was being worked on (deterministic side-data generation) when this was
+   found. Left for a deliberate, separate fix.

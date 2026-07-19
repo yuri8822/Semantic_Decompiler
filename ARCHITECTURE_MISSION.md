@@ -13,14 +13,26 @@ narrated per-phase in `BUILD_PROGRESS.md`.
   Ghidra export now also emits address-qualified callees (`calleeRefs`), so
   `relationships` can resolve same-named functions within one binary
   correctly. Verified against a real `analyzeHeadless` run, not just a
-  synthetic DB. Nothing downstream consumes the graph yet — that starts in
-  Phase 2+.
-- **Phases 2-8 — not started.** Deterministic evidence generation, evidence-
-  based whole-program prompting, a validation layer, confidence-gated
-  overwrite + contradiction detection, the iterative refinement loop,
-  semantic checkpoints/quality metrics, and `output/writer.py` catching up
-  to the graph. Sequenced risk-ascending; each phase requires a separate
-  go-ahead before starting.
+  synthetic DB.
+- **Phase 2 — done (BUILD_PROGRESS.md, session 22).** Deterministic evidence
+  generation: real dominator-based natural-loop detection, bounded
+  intraprocedural constant propagation, calling-convention extraction, and
+  partial alias hints (`analyzer/cfg_builder.py`), plus a best-effort
+  STL/library signature detector (`analyzer/library_signatures.py`) tagging
+  `known_apis.library`. Verified against the same real `find.exe` export —
+  along the way, found and fixed two real parsing bugs in this new code
+  (a varnode regex missing whitespace tolerance, and a naive comma-split
+  that shreds multi-input operands), and separately flagged — but did
+  **not** fix — that the same two bugs likely also exist in
+  `ir_builder.py` itself, meaning the p-code IR shown to the AI in every
+  prompt for passes ≤3 has probably been silently degraded for the whole
+  project's history. See BUILD_PROGRESS.md session 22 and known-edge-case
+  #9 for the full writeup; left for a deliberate, separate fix.
+- **Phases 3-8 — not started.** Evidence-based whole-program prompting, a
+  validation layer, confidence-gated overwrite + contradiction detection,
+  the iterative refinement loop, semantic checkpoints/quality metrics, and
+  `output/writer.py` catching up to the graph. Sequenced risk-ascending;
+  each phase requires a separate go-ahead before starting.
 
 ---
 

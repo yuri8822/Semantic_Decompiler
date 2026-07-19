@@ -49,9 +49,10 @@ from config import (
 from analyzer.ghidra_runner import analyze_binary
 from analyzer.parse_output import load_analysis
 from analyzer.ir_builder import build_ir
-from analyzer.cfg_builder import build_cfg_summary
+from analyzer.cfg_builder import build_cfg_summary, analyze_deterministic
 from analyzer.types_db import SemanticDB
 from analyzer.known_apis import KNOWN_APIS
+from analyzer.library_signatures import detect_library_types, classify_known_apis
 from ai.translator import MultiPassTranslator, extract_function_name
 from output.writer import ProjectWriter
 
@@ -212,14 +213,38 @@ def main():
     db = SemanticDB(DB_PATH)
     db.init()
 
-    # First pass: upsert the function row and create a `function` entity per
-    # function — entities must exist before relationships can reference them.
+    # First pass: upsert the function row, create a `function` entity per
+    # function (entities must exist before relationships can reference
+    # them), and record this function's deterministic evidence + any
+    # detected library-type usage — all pure static analysis, no AI
+    # involved, and nothing downstream reads any of it yet.
     entity_ids = {}
+    type_entity_ids = {}
     for fn in functions:
         db.upsert_function(binary_name, fn.address, fn.name, fn.signature)
         for callee in fn.callees:
             db.add_call_edge(binary_name, fn.address, callee)
-        entity_ids[fn.address.lower()] = db.create_entity(binary_name, "function", fn.address)
+        entity_id = db.create_entity(binary_name, "function", fn.address)
+        entity_ids[fn.address.lower()] = entity_id
+
+        det_facts = analyze_deterministic(fn)
+        if det_facts:
+            db.record_facts_batch([
+                {**f, "entity_id": entity_id, "confidence": 0.9, "provider": "deterministic"}
+                for f in det_facts
+            ])
+
+        for lib in detect_library_types(fn):
+            type_key = lib["type_key"]
+            type_id = type_entity_ids.get(type_key)
+            if type_id is None:
+                type_id = db.create_entity(binary_name, "type", type_key)
+                type_entity_ids[type_key] = type_id
+                db.record_fact(type_id, "library", lib["library"],
+                                confidence=lib["confidence"], evidence=lib["evidence"],
+                                provider="deterministic")
+            db.add_relationship(binary_name, entity_id, type_id, "references",
+                                 confidence=lib["confidence"], evidence=lib["evidence"])
 
     # Second pass: address-qualified `calls` relationships. Only recorded
     # when the callee resolves to one of this binary's own exported
@@ -235,6 +260,7 @@ def main():
                                      confidence=0.9, evidence=["ghidra_call_graph"])
 
     db.seed_known_apis(KNOWN_APIS)
+    db.tag_known_api_libraries(classify_known_apis())
 
     # address → name map for IR CALL annotation (lowercase hex, no 0x prefix)
     addr_map = {fn.address.lower(): fn.name for fn in functions}
