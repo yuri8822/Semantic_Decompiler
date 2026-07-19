@@ -17,7 +17,7 @@ OUTPUT_DIR = PROJECT_ROOT / "output" / "recovered"
 DB_PATH = str(PROJECT_ROOT / "semantic.db")
 
 # --- AI provider ---
-# Set LLM_PROVIDER to "anthropic", "xiaomi", "ollama", or "bonsai"
+# Set LLM_PROVIDER to "anthropic", "xiaomi", "ollama", "bonsai", or "deepseek"
 LLM_PROVIDER = "anthropic"
 
 # Anthropic (cloud)
@@ -27,6 +27,10 @@ ANTHROPIC_MODEL_FAST  = "claude-sonnet-4-6"  # the lightweight one-line summary 
 # Xiaomi MiMo — https://platform.xiaomimomo.com
 XIAOMI_BASE_URL = "https://api.xiaomimimo.com/anthropic/"
 XIAOMI_MODEL    = "mimo-v2.5-pro"
+
+# DeepSeek (cloud), OpenAI-compatible API — https://platform.deepseek.com
+DEEPSEEK_BASE_URL = "https://api.deepseek.com"
+DEEPSEEK_MODEL    = "deepseek-v4-pro"
 
 # Ollama (local) — https://ollama.com/library
 # Good code-focused models: qwen2.5-coder:7b, deepseek-coder-v2:16b, codellama:13b

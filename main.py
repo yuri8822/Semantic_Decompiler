@@ -62,6 +62,7 @@ def _check_env(provider: str):
     checks = {
         "anthropic": ("ANTHROPIC_API_KEY", "sk-ant-..."),
         "xiaomi":    ("XIAOMI_API_KEY",     "sk-s..."),
+        "deepseek":  ("DEEPSEEK_API_KEY",   "sk-..."),
     }
     if provider in checks:
         var, example = checks[provider]
@@ -109,7 +110,7 @@ def main():
         help="Process only the first N functions (0 = all)"
     )
     parser.add_argument(
-        "--provider", default=LLM_PROVIDER, choices=["anthropic", "xiaomi", "ollama", "bonsai"],
+        "--provider", default=LLM_PROVIDER, choices=["anthropic", "xiaomi", "ollama", "bonsai", "deepseek"],
         help=f"LLM provider (default: {LLM_PROVIDER})"
     )
     parser.add_argument(
