@@ -1570,6 +1570,89 @@ before falling back to the existing revert behavior.
 
 ---
 
+## What was built — session 28
+
+Architecture-mission Phase 5: confidence-gated overwrite + contradiction
+detection (mission items #3 and #11).
+
+### `analyzer/types_db.py`
+- `compute_confidence(source_type, evidence)` — `base_weight(source_type)
+  + 0.2 * min(distinct evidence categories in this call, 3)`. Deterministic
+  sources: `base=0.9`. AI-proposed facts: `base=0.5`. Counts **distinct**
+  evidence categories only, never occurrences or distinct passes — the
+  translator already threads `current_code` pass-to-pass, so the same
+  model restating its own earlier conclusion isn't independent evidence,
+  and counting occurrences would let Bonsai's documented repetition-loop
+  failure mode inflate confidence for free.
+- `_insert_fact()` (the shared path behind `record_fact`/`record_facts_batch`)
+  now: always appends the new fact row (history is never lost); if a
+  current fact already exists for `(entity_id, fact_type)`, logs a
+  `contradictions` row whenever the value materially differs — regardless
+  of whether the fact below actually wins; only flips `is_current` if
+  `new.confidence > old.confidence + CONFIDENCE_MARGIN (0.1)`, applied
+  symmetrically to any source-type combination.
+- `main.py`'s Phase 2 deterministic-fact recording now computes confidence
+  via `compute_confidence("deterministic", ...)` instead of a flat
+  hardcoded `0.9`. Library-detection confidence (0.9/0.6, reflecting
+  match-specificity uncertainty — a different axis than source-type
+  ground-truthness) deliberately stays as its own explicit value rather
+  than forced through the formula.
+
+### A real inconsistency found in the plan's own suggested constants, fixed before shipping
+The plan's suggested numbers (base 0.9/0.5, evidence step 0.15, confidence
+capped at 1.0, margin 0.1) directly contradict the plan's own explicit
+design goal — "a well-corroborated AI correction must be able to
+eventually beat a wrong deterministic fact." Checked the arithmetic before
+trusting it: a maximally-evidenced AI fact under those numbers tops out at
+`0.5 + 3×0.15 = 0.95`, which never clears even a **zero-evidence**
+deterministic fact's override threshold (`0.9 + 0.1 = 1.0`) — meaning no
+AI correction could *ever* override *any* deterministic fact, contradicting
+the stated goal outright. Root cause: the 1.0 cap and the 0.15 step were
+never checked together against the margin. Fixed by raising the evidence
+step to 0.2 and removing the artificial 1.0 ceiling (the `min(distinct, 3)`
+term already bounds the natural maximum — 1.5 for deterministic, 1.1 for
+AI — so no separate cap is needed). Re-verified: a 3-category-corroborated
+AI fact (1.1) now genuinely exceeds a bare deterministic fact's threshold
+(1.0), while a well-evidenced deterministic fact (up to 1.5) still can't be
+casually overridden by AI alone — matching the intended "near-ground-truth
+but not literally unfalsifiable" behavior.
+
+### Verification
+- Unit-tested `compute_confidence()` directly: base weights, evidence-step
+  scaling, the 3-category cap, distinct-vs-duplicate evidence counting
+  (`["a","a","a"]` scores the same as `["a"]`), and an unrecognized
+  `source_type` failing safe to the lower ("ai") weight rather than
+  failing open. Explicitly asserted the design goal itself (a
+  maximally-evidenced AI fact's confidence must exceed a bare
+  deterministic fact's override threshold) rather than just trusting the
+  arithmetic by inspection.
+- Unit-tested the margin-gated overwrite + contradiction logging via
+  `record_fact`/`record_facts_batch` end-to-end: first fact for an entity
+  becomes current unconditionally; same-value reinforcement with higher
+  confidence promotes without logging a contradiction; a different value
+  that doesn't clear the margin is **not** promoted but **is** logged as a
+  contradiction, and the outranked fact stays retrievable via
+  `get_entity_facts(current_only=False)`; a different value that does
+  clear the margin is promoted **and** logged; `record_facts_batch()`
+  goes through the identical logic.
+- **Verified against real historical data, not synthetic-only** — pulled
+  two real cases from `semantic.db` where the AI's chosen name genuinely
+  changed and then reverted across passes (`___chkstk_ms`: pass 4 proposed
+  `check_stack_msi`, pass 5 reverted to `___chkstk_ms`; `eq`: pass 3
+  proposed `char_traits_equal`, pass 4 reverted to `eq`) and fed the real
+  extracted name strings through `record_fact()` pass-by-pass. Both
+  correctly logged as contradictions. Also confirmed realistic behavior
+  under equal evidence strength: neither pass's proposal in these two real
+  cases had a meaningfully stronger evidence signal than the other, so the
+  engine correctly did *not* flip-flop between them — it kept the earlier
+  name current while still logging the disagreement, rather than churning
+  on every re-evaluation. Separately confirmed a genuinely
+  well-corroborated correction (3 distinct evidence categories) *does*
+  override a weakly-evidenced earlier claim, with realistic evidence-tag
+  counts a real pass might plausibly attach — not just abstract arithmetic.
+
+---
+
 ## Known limitations / next steps
 
 ### Still to build

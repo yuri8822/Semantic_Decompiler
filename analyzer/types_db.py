@@ -37,6 +37,55 @@ import sqlite3
 from contextlib import contextmanager
 from typing import Optional
 
+# Confidence formula (architecture-mission Phase 5): confidence =
+# base_weight(source_type) + evidence_bonus. Deterministic (Ghidra-derived:
+# signatures, CFG analysis, p-code) sources are treated as near-ground-truth;
+# AI-proposed facts start lower and only gain confidence from genuinely
+# distinct corroborating evidence.
+#
+# Deliberately uncapped (no artificial 1.0 ceiling): the plan's own design
+# goal is that "a well-corroborated AI correction must be able to eventually
+# beat a wrong deterministic fact" (cfg_builder's own analyses are
+# approximations, not ground truth either). Verified this is actually
+# achievable with these constants: a maximally-evidenced AI fact
+# (0.5 + 3*0.2 = 1.1) exceeds even a zero-evidence deterministic fact's
+# override threshold (0.9 + MARGIN = 1.0) — capping at a flat 1.0 (an
+# earlier version of this formula did, with a 0.15 step) would have made
+# that structurally impossible instead, silently contradicting the design
+# goal. The min(distinct, 3) cap already bounds the natural maximum (1.5
+# for deterministic, 1.1 for AI), so no separate ceiling is needed.
+_CONFIDENCE_BASE_WEIGHT = {
+    "deterministic": 0.9,
+    "ai": 0.5,
+}
+_CONFIDENCE_EVIDENCE_STEP = 0.2
+_CONFIDENCE_EVIDENCE_CAP = 3
+
+# A new fact must clear the current one's confidence by more than this
+# margin to actually become `is_current` — without a margin, near-tied
+# conclusions would flip back and forth on every re-evaluation.
+CONFIDENCE_MARGIN = 0.1
+
+
+def compute_confidence(source_type: str, evidence: Optional[list] = None) -> float:
+    """
+    confidence = base_weight(source_type) + 0.2 * min(distinct evidence
+    categories passed in THIS call, 3).
+
+    Deliberately counts DISTINCT evidence categories from a single call,
+    never distinct passes or repeated restatements: the translator already
+    threads `current_code` pass-to-pass, so the same model repeating its
+    own earlier conclusion across passes is not independent evidence — and
+    counting occurrences instead of distinct categories would also let
+    Bonsai's documented repetition-loop failure mode inflate confidence for
+    free. `source_type` defaults to the lower ("ai") weight for anything
+    unrecognized, so a typo'd source_type fails safe rather than fails open.
+    """
+    base = _CONFIDENCE_BASE_WEIGHT.get(source_type, _CONFIDENCE_BASE_WEIGHT["ai"])
+    distinct = len(set(evidence or []))
+    bonus = _CONFIDENCE_EVIDENCE_STEP * min(distinct, _CONFIDENCE_EVIDENCE_CAP)
+    return round(base + bonus, 4)
+
 
 class SemanticDB:
     # Additive columns on `functions` — the single source of truth for both
@@ -534,11 +583,10 @@ class SemanticDB:
     # Knowledge graph: entities / facts / relationships / contradictions
     # ------------------------------------------------------------------
     #
-    # Phase 1 of the architecture-mission plan: pure additive side-data.
-    # Nothing in the existing pass pipeline reads or writes these tables
-    # yet — `record_fact` currently does a plain last-write-wins overwrite
-    # (superseding whatever was `is_current` before); the confidence-margin
-    # gate and contradiction logging on top of it land in a later phase.
+    # Schema from Phase 1 (pure additive side-data), evidence generation
+    # from Phase 2, prompt consumption from Phase 3. Phase 5 adds the
+    # confidence formula, the margin-gated overwrite rule, and
+    # contradiction logging in `_insert_fact` below.
 
     def create_entity(self, binary: str, kind: str, key: str) -> int:
         """Idempotently create (or fetch) an entity, returning its id."""
@@ -603,17 +651,49 @@ class SemanticDB:
     def _insert_fact(self, conn, entity_id: int, fact_type: str, value: str,
                       confidence: float, evidence: Optional[list],
                       source_pass: Optional[int], provider: str) -> int:
-        conn.execute("""
-            UPDATE entity_facts SET is_current = 0
-            WHERE entity_id = ? AND fact_type = ? AND is_current = 1
-        """, (entity_id, fact_type))
+        """
+        Append the new fact row (always — history is never lost, even when
+        it loses below). If no fact of this type exists yet for the entity,
+        the new row becomes current immediately (nothing to compare
+        against). Otherwise: a materially different value ALWAYS logs a
+        `contradictions` row, regardless of whether the margin below is
+        cleared; the new row only actually becomes `is_current` if
+        `new.confidence > old.confidence + CONFIDENCE_MARGIN` — applied
+        symmetrically regardless of source, so a well-corroborated
+        correction can eventually beat a previously-confident but wrong
+        fact from any source.
+        """
+        existing = conn.execute("""
+            SELECT * FROM entity_facts WHERE entity_id = ? AND fact_type = ? AND is_current = 1
+        """, (entity_id, fact_type)).fetchone()
+
         cur = conn.execute("""
             INSERT INTO entity_facts
                 (entity_id, fact_type, value, confidence, evidence, source_pass, provider, is_current)
-            VALUES (?, ?, ?, ?, ?, ?, ?, 1)
+            VALUES (?, ?, ?, ?, ?, ?, ?, 0)
         """, (entity_id, fact_type, value, confidence, json.dumps(evidence or []),
               source_pass, provider))
-        return cur.lastrowid
+        new_id = cur.lastrowid
+
+        if existing is None:
+            conn.execute("UPDATE entity_facts SET is_current = 1 WHERE id = ?", (new_id,))
+            return new_id
+
+        if existing["value"] != value:
+            conn.execute("""
+                INSERT INTO contradictions (entity_id, fact_type, old_fact_id, new_fact_id)
+                VALUES (?, ?, ?, ?)
+            """, (entity_id, fact_type, existing["id"], new_id))
+
+        if confidence > existing["confidence"] + CONFIDENCE_MARGIN:
+            conn.execute("""
+                UPDATE entity_facts SET is_current = 0
+                WHERE entity_id = ? AND fact_type = ? AND is_current = 1
+            """, (entity_id, fact_type))
+            conn.execute("UPDATE entity_facts SET is_current = 1 WHERE id = ?", (new_id,))
+        # else: stays is_current=0 — outranked, but preserved in history.
+
+        return new_id
 
     def get_current_fact(self, entity_id: int, fact_type: str) -> Optional[dict]:
         with self._conn() as conn:

@@ -86,10 +86,25 @@ narrated per-phase in `BUILD_PROGRESS.md`.
   cases: legitimate return-collapsing, moderate branch reduction,
   pre-existing recursion) and 2 full integration tests against the real
   `translate()` method with a mocked LLM forcing real validation failures.
-- **Phases 5-8 — not started.** Confidence-gated overwrite + contradiction
-  detection, the iterative refinement loop, semantic checkpoints/quality
-  metrics, and `output/writer.py` catching up to the graph. Sequenced
-  risk-ascending; each phase requires a separate go-ahead before starting.
+- **Phase 5 — done (BUILD_PROGRESS.md, session 28).** Confidence-gated
+  overwrite + contradiction detection: `compute_confidence(source_type,
+  evidence)` in `analyzer/types_db.py`, and `_insert_fact()` now only
+  flips `is_current` when `new.confidence > old.confidence +
+  CONFIDENCE_MARGIN`, always logging a `contradictions` row on any
+  materially different value regardless of which one wins. Found and fixed
+  a real inconsistency in the plan's own suggested constants before
+  shipping: the originally suggested numbers (0.15 evidence step, capped
+  at 1.0) made it *structurally impossible* for any AI correction to ever
+  override any deterministic fact, directly contradicting the plan's own
+  stated goal — fixed by raising the step to 0.2 and removing the
+  artificial ceiling. Verified against two real historical rename-then-
+  revert cases pulled from `semantic.db` (both correctly logged as
+  contradictions, with no flip-flopping under equal evidence strength) and
+  confirmed a well-corroborated correction does override a weak one.
+- **Phases 6-8 — not started.** The iterative refinement loop, semantic
+  checkpoints/quality metrics, and `output/writer.py` catching up to the
+  graph. Sequenced risk-ascending; each phase requires a separate go-ahead
+  before starting.
 
 ---
 

@@ -50,7 +50,7 @@ from analyzer.ghidra_runner import analyze_binary
 from analyzer.parse_output import load_analysis
 from analyzer.ir_builder import build_ir
 from analyzer.cfg_builder import build_cfg_summary, analyze_deterministic
-from analyzer.types_db import SemanticDB
+from analyzer.types_db import SemanticDB, compute_confidence
 from analyzer.known_apis import KNOWN_APIS
 from analyzer.library_signatures import detect_library_types, classify_known_apis
 from ai.translator import MultiPassTranslator, extract_function_name
@@ -230,10 +230,17 @@ def main():
         det_facts = analyze_deterministic(fn)
         if det_facts:
             db.record_facts_batch([
-                {**f, "entity_id": entity_id, "confidence": 0.9, "provider": "deterministic"}
+                {**f, "entity_id": entity_id,
+                 "confidence": compute_confidence("deterministic", f.get("evidence")),
+                 "provider": "deterministic"}
                 for f in det_facts
             ])
 
+        # Library-detection confidence (0.9 specific match / 0.6 generic
+        # mangled-but-unrecognized, from library_signatures.py) reflects
+        # match-specificity uncertainty, a different axis than the standard
+        # deterministic/ai source-type formula — kept as its own explicit
+        # value rather than forced through compute_confidence().
         for lib in detect_library_types(fn):
             type_key = lib["type_key"]
             type_id = type_entity_ids.get(type_key)
