@@ -74,11 +74,22 @@ narrated per-phase in `BUILD_PROGRESS.md`.
   in `semantic.db`, and by running the actual `translate()` method against
   a real completed function (resumed cleanly through all 6 passes,
   exercising the new code with zero exceptions).
-- **Phases 4-8 — not started.** A validation layer, confidence-gated
-  overwrite + contradiction detection, the iterative refinement loop,
-  semantic checkpoints/quality metrics, and `output/writer.py` catching up
-  to the graph. Sequenced risk-ascending; each phase requires a separate
-  go-ahead before starting.
+- **Phase 4 — done (BUILD_PROGRESS.md, session 27).** The validation
+  layer: `ai/translator.py` gained `validate_transition()`, generalizing
+  the original callee guard (kept unchanged) into six checks — callee
+  guard, return-statement-dropped, branch-count-vs-CFG, self-recursion,
+  unknown-API/global (soft warning only), and stack-variable-count — plus
+  one bounded retry-with-feedback before falling back to the existing
+  revert-to-`prev_code` behavior. Directly mitigates the self-recursive
+  "delegate to the real implementation" stub bug (known-edge-case #8).
+  Verified with 12 unit checks (every check plus the false-positive edge
+  cases: legitimate return-collapsing, moderate branch reduction,
+  pre-existing recursion) and 2 full integration tests against the real
+  `translate()` method with a mocked LLM forcing real validation failures.
+- **Phases 5-8 — not started.** Confidence-gated overwrite + contradiction
+  detection, the iterative refinement loop, semantic checkpoints/quality
+  metrics, and `output/writer.py` catching up to the graph. Sequenced
+  risk-ascending; each phase requires a separate go-ahead before starting.
 
 ---
 

@@ -8,6 +8,7 @@ everything at once.
 
 import json
 import re
+from dataclasses import dataclass, field
 
 from config import NUM_PASSES, OLLAMA_MODEL, LLM_PROVIDER
 from ai.llm_client import LLMClient
@@ -139,6 +140,132 @@ def _dropped_callees(before: str, after: str, callees: list[str]) -> set[str]:
         if called_before and not called_after:
             dropped.add(name)
     return dropped
+
+
+# ---------------------------------------------------------------------------
+# Validation layer (architecture-mission Phase 4). Generalizes the callee
+# guard above into a broader set of cheap, text/regex-level checks —
+# deliberately not AST diffing (out of scope for this phase; would need a
+# real C++ parser). Hard-reject checks are kept to ones with low
+# false-positive risk; anything murkier becomes a warning that doesn't
+# block the pass, since false positives on things like "possibly invented
+# API" are real and would otherwise stall legitimate passes.
+# ---------------------------------------------------------------------------
+
+@dataclass
+class ValidationResult:
+    accepted: bool
+    reasons: list = field(default_factory=list)    # hard-reject reasons
+    warnings: list = field(default_factory=list)   # soft, non-blocking
+
+
+_RETURN_RE = re.compile(r'\breturn\b')
+_BRANCH_KEYWORDS_RE = re.compile(r'\b(?:if|for|while|switch)\s*\(|\bcase\b')
+_COND_BRANCHES_RE = re.compile(r'Cond\. branches:\s*(\d+)')
+
+# Best-effort local-variable-declaration proxy: "[qualifiers] TYPE NAME [= ...];"
+# with no parens between NAME and the trailing ';' (so it doesn't match
+# function declarations/definitions, which have a parameter list there).
+# Known imprecise: doesn't handle comma-separated multi-declarators
+# ("int a, b;" undercounts) — acceptable for a cheap regex-level check,
+# same spirit as this codebase's other approximate heuristics (e.g.
+# cfg_builder.py's naive cyclomatic-complexity formula).
+_LOCAL_DECL_RE = re.compile(
+    r'^(?:const\s+|static\s+|volatile\s+|constexpr\s+)*'
+    r'[A-Za-z_]\w*(?:::\w+)*(?:\s*[\*&])*\s+[A-Za-z_]\w*\s*(?:=[^;()]*)?;$'
+)
+
+
+def _count_branches(code: str) -> int:
+    return len(_BRANCH_KEYWORDS_RE.findall(code))
+
+
+def _count_local_decls(code: str) -> int:
+    count = 0
+    for line in code.split("\n"):
+        s = line.strip()
+        if not s or re.match(r'^(struct|class|enum|typedef|extern|return)\b', s):
+            continue
+        if _LOCAL_DECL_RE.match(s):
+            count += 1
+    return count
+
+
+def _call_site_names(code: str) -> set:
+    """Every identifier that appears as a genuine call site somewhere in code."""
+    names = set()
+    for line in code.split("\n"):
+        for m in re.finditer(r'\b([A-Za-z_]\w*)\s*\(', line):
+            candidate = m.group(1)
+            if candidate in _NAME_SKIP:
+                continue
+            if _is_call_site(candidate, line):
+                names.add(candidate)
+    return names
+
+
+def validate_transition(prev_code: str, new_code: str, callees: list,
+                         locked_name: str, cfg_summary: str, pass_num: int) -> ValidationResult:
+    """
+    Runs every cheap correctness check on one pass's proposed transition
+    (prev_code -> new_code). Includes the original callee guard unchanged.
+    """
+    reasons = []
+    warnings = []
+
+    # Callee guard (pre-existing, unchanged) — hard reject.
+    if pass_num >= 3 and callees:
+        dropped = _dropped_callees(prev_code, new_code, callees)
+        if dropped:
+            reasons.append(f"dropped call(s) to: {', '.join(sorted(dropped))}")
+
+    # Return-statement-dropped — hard reject only on >=1 -> 0, not exact count
+    # (collapsing duplicate early-returns into one guard clause is legitimate).
+    prev_returns = len(_RETURN_RE.findall(prev_code))
+    new_returns = len(_RETURN_RE.findall(new_code))
+    if prev_returns >= 1 and new_returns == 0:
+        reasons.append("all return statements were removed")
+
+    # Branch-count vs. the original (pre-AI) CFG analysis — hard reject only
+    # on a large drop (>30%), not exact match; beautification legitimately
+    # rewrites if/else into other equivalent forms sometimes.
+    m = _COND_BRANCHES_RE.search(cfg_summary or "")
+    if m:
+        cfg_branches = int(m.group(1))
+        if cfg_branches > 0:
+            new_branches = _count_branches(new_code)
+            if new_branches < cfg_branches * 0.7:
+                reasons.append(
+                    f"branch count dropped from ~{cfg_branches} (per CFG analysis) "
+                    f"to {new_branches} in the output"
+                )
+
+    # Self-recursion — hard reject, but only newly-introduced recursion, so
+    # a function that's genuinely already (correctly) recursive isn't
+    # falsely flagged every pass.
+    if locked_name:
+        was_recursive = any(_is_call_site(locked_name, line) for line in prev_code.split("\n"))
+        is_recursive = any(_is_call_site(locked_name, line) for line in new_code.split("\n"))
+        if is_recursive and not was_recursive:
+            reasons.append(f"function calls itself ('{locked_name}') — likely hallucinated self-recursion")
+
+    # Unknown API/global — soft warning only. False positives are real here
+    # (legitimate local helper names introduced during class recon), so this
+    # never blocks a pass.
+    known = set(callees) | _call_site_names(prev_code)
+    newly_called = _call_site_names(new_code) - known
+    if newly_called:
+        warnings.append(f"possibly invented call(s) not seen before this pass: {', '.join(sorted(newly_called))}")
+
+    # Stack-variable-count — pass >=3 only (pass 1's legitimate dead-store
+    # removal would otherwise false-positive). Hard reject on a large drop.
+    if pass_num >= 3:
+        prev_locals = _count_local_decls(prev_code)
+        new_locals = _count_local_decls(new_code)
+        if prev_locals >= 2 and new_locals < prev_locals * 0.5:
+            reasons.append(f"local variable count dropped from {prev_locals} to {new_locals}")
+
+    return ValidationResult(accepted=not reasons, reasons=reasons, warnings=warnings)
 
 
 _TYPE_START_RE = re.compile(
@@ -333,12 +460,35 @@ class MultiPassTranslator:
 
             new_code = _call_llm(self._llm, system, user, pass_num)
 
-            # Fix 1 — callee guard: revert if any known callee was silently dropped.
-            # Only applied from pass 3 onwards (pass 2 legitimately renames calls).
-            if pass_num >= 3 and callees:
-                dropped = _dropped_callees(prev_code, new_code, callees)
-                if dropped:
-                    new_code = prev_code  # reject this pass, keep previous output
+            # Validation layer (architecture-mission Phase 4): run every
+            # cheap correctness check (includes the original callee guard).
+            # On failure, one bounded retry with explicit feedback about
+            # what was wrong, restarting from prev_code (never compounding
+            # on the rejected output); if the retry also fails, fall back
+            # to the original revert-to-prev_code behavior.
+            locked_name = ai_name or name
+            result = validate_transition(prev_code, new_code, callees, locked_name, cfg_summary, pass_num)
+
+            if not result.accepted:
+                print(f"[translator] Pass {pass_num} rejected for {name}: "
+                      f"{'; '.join(result.reasons)} — retrying once with feedback")
+                feedback = (
+                    "\n\nVALIDATION FAILURE — your previous attempt was rejected for:\n"
+                    + "\n".join(f"  - {r}" for r in result.reasons)
+                    + "\nRegenerate from the CODE TO PROCESS above, preserving everything "
+                      "the failure(s) above call out. Do not repeat the same mistake."
+                )
+                retry_code = _call_llm(self._llm, system, user + feedback, pass_num)
+                retry_result = validate_transition(prev_code, retry_code, callees, locked_name, cfg_summary, pass_num)
+                if retry_result.accepted:
+                    new_code, result = retry_code, retry_result
+                else:
+                    print(f"[translator] Pass {pass_num} retry also rejected for {name}: "
+                          f"{'; '.join(retry_result.reasons)} — reverting to previous pass's output")
+                    new_code = prev_code  # fall back to the pre-existing revert behavior
+
+            if result.warnings:
+                print(f"[translator] Pass {pass_num} warning for {name}: {'; '.join(result.warnings)}")
 
             current_code = new_code
             self.db.set_pass_output(self.binary_name, address, pass_num, current_code)

@@ -1510,6 +1510,66 @@ REFERENCED` and `WHOLE-PROGRAM CONTEXT` (both pass ≥3, matching
 
 ---
 
+## What was built — session 27
+
+Architecture-mission Phase 4: the validation layer (mission item #7).
+Generalizes the original callee guard into a broader set of cheap,
+text/regex-level checks (deliberately not AST diffing — out of scope,
+would need a real C++ parser), plus a bounded retry with explicit feedback
+before falling back to the existing revert behavior.
+
+### `ai/translator.py`
+- `ValidationResult` (small dataclass: `accepted`, `reasons`, `warnings`)
+  and `validate_transition(prev_code, new_code, callees, locked_name,
+  cfg_summary, pass_num)`, which runs:
+  - **Callee guard** — the original `_dropped_callees` logic, completely
+    unchanged, still pass ≥3 only.
+  - **Return-statement-dropped** — hard reject only on `>=1 -> 0`, not
+    exact-count, so collapsing duplicate early-returns into one guard
+    clause (legitimate pass-6 cleanup) doesn't false-positive.
+  - **Branch-count vs. the original CFG analysis** — regex-counts
+    `if/for/while/switch/case` in the output, compares against
+    `cfg_builder`'s pre-AI `Cond. branches` figure, hard-rejects only on a
+    >30% drop (reuses existing CFG output, no new analysis).
+  - **Self-recursion** — hard reject, but only *newly introduced*
+    recursion (checks both `prev_code` and `new_code`), so a function
+    that's genuinely, correctly recursive already isn't flagged every
+    single pass. Directly targets the documented "delegate to the real
+    implementation" self-recursive-stub bug (known limitation, item 8).
+  - **Unknown API/global** — soft **warning** only, never blocks a pass;
+    false positives here are real (legitimate new local helpers during
+    class recon), so this only lowers confidence rather than rejecting.
+  - **Stack-variable-count** — pass ≥3 only (pass 1's legitimate
+    dead-store removal would otherwise false-positive), hard reject on a
+    large drop. Uses a best-effort declaration-counting regex, documented
+    as imprecise (doesn't handle comma-separated multi-declarators) — same
+    spirit as this codebase's other approximate heuristics.
+- The main pass loop now calls `validate_transition()` after every LLM
+  call. On rejection: **one bounded retry** — re-prompts with a
+  `VALIDATION FAILURE` block naming the specific violated check(s),
+  restarting from `prev_code` (never compounding on the rejected output).
+  If the retry also fails, falls back to the original revert-to-`prev_code`
+  behavior. Warnings are logged but never block.
+
+### Verification
+- 12 unit checks against `validate_transition()` directly, covering every
+  check plus the edge cases that must *not* false-positive: a real
+  historical-shaped callee-drop (caught), the guard correctly inactive
+  before pass 3, legitimate return-collapsing (2→1, not rejected),
+  moderate/legitimate branch reduction within the 30% margin (not
+  rejected), newly-introduced self-recursion (caught) vs. pre-existing
+  legitimate recursion (not flagged), an invented call (warning only,
+  still accepted), and the stack-variable check firing at pass 3 but
+  correctly not firing on the identical drop at pass 1.
+- 2 full integration tests against the actual `translate()` method (not a
+  reimplementation), with a mocked LLM client forcing real validation
+  failures: (a) pass fails, retry succeeds — confirmed the retry's actual
+  new output is used, not a blind fallback; (b) pass fails, retry also
+  fails — confirmed a clean revert to `prev_code` with no more than one
+  retry attempted.
+
+---
+
 ## Known limitations / next steps
 
 ### Still to build
@@ -1589,12 +1649,19 @@ REFERENCED` and `WHOLE-PROGRAM CONTEXT` (both pass ≥3, matching
    not a stylistic rough edge — the model appears to hallucinate a distinct
    external symbol with the same spelling as the local one it just defined.
    Seen across several functions in the same file, so not a one-off. Not yet
-   root-caused or fixed — unrelated to the Bonsai reasoning-leak issues above
+   root-caused — unrelated to the Bonsai reasoning-leak issues above
    (this file also happened to contain a raw chain-of-thought dump from that
    separate bug, but this self-recursion pattern showed up in functions
    untouched by that leak too). Needs a closer look once a clean re-run
    (reasoning off) is available to compare against — worth checking whether
    it's Bonsai-specific or shows up with other providers too.
+   **Partially mitigated in session 27**: the new validation layer's
+   self-recursion check now hard-rejects a pass that *newly introduces* a
+   call to the function's own locked name, triggering a retry-with-feedback
+   and falling back to the previous pass's (non-recursive) output if the
+   retry doesn't fix it — so this specific pattern can no longer silently
+   ship. The underlying hallucination tendency itself is still unexplained
+   and unfixed; this only stops it from reaching `recovered.cpp`.
 
 9. ~~`ir_builder.py`'s varnode regex likely never matches real p-code
    text~~ **Fixed in session 23.** `_VARNODE_RE` had no whitespace
