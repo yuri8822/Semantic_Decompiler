@@ -5,4 +5,4 @@ REM script, and `cmd /k` keeps that window open after exit so a crash/error
 REM stays visible instead of flashing shut.
 REM %~dp0 = this script's own directory, so it works no matter where it's run from.
 
-start "AI Semantic Decompiler" /D "%~dp0" cmd /k python main.py "TestBinaries\Chess.exe" --provider bonsai --restart
+start "AI Semantic Decompiler" /D "%~dp0" cmd /k python main.py "TestBinaries\Chess.exe" --provider deepseek --restart

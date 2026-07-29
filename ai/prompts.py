@@ -1,51 +1,80 @@
 """
 Single-pass system prompt and user-prompt builder.
 
-One prompt does the full reconstruction (cleanup, renaming, type
-inference, class reconstruction, consistency with callers/callees,
-beautification) in one shot, fed the richest context the pipeline can
-gather (analyzer/cfg_builder.py's deterministic evidence,
-analyzer/library_signatures.py's library hints, the whole-program
-knowledge graph, callee/caller summaries, known-API signatures, p-code
-IR, and the CFG summary).
+Deliberately a minimal-diff ANNOTATION task, not a regeneration task (see
+BUILD_PROGRESS.md session 35): Ghidra's decompiled output is a faithful,
+logic-preserving representation of the actual compiled machine code --
+every statement, every branch, every call already reflects what the
+binary really does. Asking the model to "produce a complete idiomatic
+reconstruction" invites it to regenerate the function from scratch, and
+regeneration is where hallucination actually happens: invented class
+layouts, invented vtables, placement-new tricks nobody asked for,
+restructured control flow. Renaming and typing an already-correct
+statement carries none of that risk -- it's substitution, not invention.
+Still fed the same rich context the pipeline gathers (deterministic
+evidence, library hints, whole-program context, callee/caller summaries,
+known-API signatures, p-code IR, CFG summary) -- that evidence is exactly
+as useful for choosing a good name or a good type as it ever was; only
+the *task* it's used for has narrowed.
 """
 
-SYSTEM_PROMPT = """You are an expert reverse engineer and C++ systems programmer.
-Static analysis output is authoritative — you must preserve all logic exactly.
-Never hallucinate behavior that is not supported by the decompiler output.
-When uncertain, use a comment to express the uncertainty rather than guessing.
-Return ONLY code. No markdown fences, no explanation outside comments.
+SYSTEM_PROMPT = """You are annotating decompiled C code, not rewriting it.
 
-TASK — Full reconstruction in a single pass. Given the decompiled C,
-p-code, and all evidence below, produce ONE complete, idiomatic modern
-C++ reconstruction of this function, doing all of the following:
+Static analysis (the decompiled code below) is authoritative: it is a
+faithful, logic-preserving representation of the actual compiled machine
+code. Your job is narrow -- make it more readable by substituting names
+and adding type information, without changing what it does or how it
+does it.
 
-1. CLEANUP — remove compiler boilerplate (redundant casts, identity
-   assignments, dead stores); simplify obviously-equivalent expressions.
-2. RENAMING — rename the function and its variables/parameters to
-   meaningful names using string literals, API/import calls, arithmetic
-   patterns, and control-flow patterns as evidence.
-3. TYPE INFERENCE — identify struct/class field-access patterns and
-   propose struct/enum/typedef definitions above the function where the
-   evidence below actually supports it.
-4. CLASS RECONSTRUCTION — identify 'this'-pointer patterns and convert to
-   C++ method syntax where evidence supports it. Only add inheritance or
-   virtual-dispatch markers with real vtable/RTTI evidence; prefer plain
-   functions/structs when the evidence is weak.
-5. CONSISTENCY — align parameter names/types with what the callee/caller
-   summaries below show, if any are given.
-6. BEAUTIFICATION — idiomatic modern C++ (const-correctness, nullptr,
-   range-for where natural), with a short doc comment above the function.
+TASK — given the decompiled code and all evidence below, produce a
+version of the SAME function that:
 
-Hard constraints:
-- Do NOT drop any call the original decompiled code makes.
-- Do NOT remove every return statement from a function that returns a value.
-- Do NOT make the function call itself unless the original genuinely does.
-- Do NOT collapse the real branch/conditional structure of the original code.
-- Do NOT invent classes, types, or "recovered types from other functions"
-  content that isn't evidenced by THIS function's own code — the
-  whole-program/library context below is background only, never something
-  to echo verbatim into your answer."""
+1. RENAMES the function and its own local variables/parameters to
+   meaningful names, using string literals, imported/API calls, and
+   arithmetic/control-flow patterns as evidence. Rename anything you have
+   real evidence for; leave anything you don't as-is (or give it an
+   honest, generic name) rather than guess. This applies ONLY to this
+   function's own locals/parameters/name — a reference to an external
+   symbol (a global, a vtable pointer, an imported/known-API name, an
+   address label like PTR_Something_140009a60) must be preserved EXACTLY
+   as spelled in the input. Do not rename, "clean up", or invent a
+   friendlier name for anything you did not declare yourself.
+2. ADDS type information — replace decompiler placeholder types
+   (undefinedN, byte, etc.) with concrete types where the evidence below
+   actually supports it, and substitute casts like-for-like where the
+   original already casts something.
+3. ADDS short comments explaining non-obvious intent, only where the
+   evidence actually supports a real explanation, never speculative
+   narration.
+
+HARD CONSTRAINTS — read this section as absolute, not aspirational:
+- Preserve EVERY statement from the input, in the same order. Do not add,
+  remove, merge, split, reorder, or restructure statements.
+- Preserve the EXACT control-flow shape: every if/else/while/for/do/goto/
+  switch/case/label stays structured exactly as in the input. Do not
+  convert a goto-loop into a for-loop, do not flatten nested conditionals,
+  do not restructure anything "for clarity" — clarity comes only from
+  naming and comments, never from changing shape.
+- Do NOT invent classes, structs, vtables, placement-new, custom
+  allocators, or STL container usage that isn't already explicit in the
+  input. A raw offset dereference (`*(int*)(this + 8)`) may get a
+  type-appropriate cast at most — convert it to member-access syntax
+  (`this->field`) ONLY if a real struct/class definition for that exact
+  type already exists in the evidence below and matches exactly; never
+  invent one to make the access look nicer.
+- Do NOT change the number, order, or argument count of function calls.
+  Every call in the input must appear, unchanged, in your output.
+- Do NOT rename a reference to anything you didn't declare yourself —
+  a global, a vtable pointer, an address label (PTR_Something_140009a60),
+  an imported symbol. Copy it character-for-character from the input.
+  Inventing a friendlier name for it is not a rename, it's a fabricated
+  symbol that will fail to link.
+- If you're not confident about a rename or a type, prefer a
+  conservative, honest choice — or the original name — over a guess
+  that reads well but isn't evidenced.
+
+Return ONLY code: the same function, same shape, better names and types.
+No markdown fences, no explanation outside comments."""
 
 
 def build_user_prompt(function_data: dict, ir: str = "", cfg_summary: str = "",
@@ -78,7 +107,12 @@ def build_user_prompt(function_data: dict, ir: str = "", cfg_summary: str = "",
         parts.append(library_hints)
 
     if recovered_types:
-        parts.append("\nRECOVERED TYPES FROM OTHER FUNCTIONS (background only — do not echo verbatim):")
+        parts.append(
+            "\nRECOVERED TYPES ALREADY ESTABLISHED FOR THIS BINARY "
+            "(the only definitions you may use for member-access syntax "
+            "on a raw offset — an exact name match, not inspiration for "
+            "a new one):"
+        )
         parts.append(recovered_types)
 
     if whole_program_context:

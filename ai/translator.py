@@ -29,6 +29,8 @@ def _strip_fences(text: str) -> str:
 _NAME_SKIP = frozenset({
     "if", "else", "while", "for", "switch", "do", "return",
     "struct", "class", "enum", "typedef", "extern", "static", "inline",
+    "decltype", "sizeof", "typename", "noexcept", "alignof", "requires",
+    "const", "constexpr", "consteval",
 })
 
 

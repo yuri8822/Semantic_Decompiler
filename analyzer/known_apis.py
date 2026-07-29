@@ -159,7 +159,7 @@ KNOWN_APIS: dict[str, tuple[str, str]] = {
     # ------------------------------------------------------------------ #
     # Windows — heap
     # ------------------------------------------------------------------ #
-    "GetProcessHeap": ("HANDLE HeapHandle GetProcessHeap(void)",                      "Get default process heap handle"),
+    "GetProcessHeap": ("HANDLE GetProcessHeap(void)",                                 "Get default process heap handle"),
     "HeapAlloc":      ("LPVOID HeapAlloc(HANDLE hHeap, DWORD dwFlags, SIZE_T dwBytes)", "Allocate from heap; HEAP_ZERO_MEMORY=8"),
     "HeapFree":       ("BOOL   HeapFree(HANDLE hHeap, DWORD dwFlags, LPVOID lpMem)",  "Free heap allocation"),
     "HeapCreate":     ("HANDLE HeapCreate(DWORD flOptions, SIZE_T dwInitSize, SIZE_T dwMaxSize)", "Create private heap"),

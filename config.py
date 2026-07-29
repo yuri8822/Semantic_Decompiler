@@ -48,7 +48,12 @@ BONSAI_BASE_URL   = "http://localhost:8080/v1"
 BONSAI_MODEL      = "Bonsai-27B-Q1_0"  # sent in the request; llama-server ignores it and serves whatever's loaded
 BONSAI_MAX_TOKENS = 4096
 
-MAX_TOKENS        = 8192  # Anthropic / Xiaomi
+MAX_TOKENS        = 16384  # Anthropic / Xiaomi / DeepSeek -- 8192 was
+# observed truncating real functions mid-statement (Rook::Move,
+# Engine::ProcessPlayerMove in a real deepseek run), which then got
+# silently accepted as "the whole function". Billed on tokens actually
+# generated, not this cap, so raising it doesn't cost anything unless a
+# function genuinely needs the extra room -- which some already did.
 OLLAMA_MAX_TOKENS = 4096  # local models typically cap at 4k
 AI_TIMEOUT_SECONDS = 120
 DECOMPILER_TIMEOUT_SECONDS = 60
