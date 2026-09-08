@@ -43,7 +43,21 @@ OLLAMA_MODEL    = "carstenuhlig/omnicoder-9b:q4_k_m"
 # talks to it as-is.
 LLAMACPP_BASE_URL   = "http://localhost:8080/v1"
 LLAMACPP_MODEL      = "local"  # sent in the request; llama-server ignores it and serves whatever's loaded
-LLAMACPP_MAX_TOKENS = 4096
+
+# Output cap, set to the server's own context size (start_llamacpp.bat's
+# `-c`) so it stops being a separate limit: the only real bound on a
+# response becomes the context left over after the prompt. Deliberately not
+# a smaller number -- 8192 was already observed truncating real functions
+# mid-statement (see MAX_TOKENS below), and each call gets a fresh context
+# holding one function, so there's nothing to conserve budget for.
+# Keep in sync with `-c` in start_llamacpp.bat if you change it there.
+#
+# Thinking is configured server-side in start_llamacpp.bat (currently on,
+# budgeted at 2048 tokens, with thoughts routed to `reasoning_content`).
+# Those tokens come out of this same generation budget, so the answer gets
+# LLAMACPP_MAX_TOKENS minus whatever thinking consumed.
+LLAMACPP_CONTEXT_SIZE = 49152
+LLAMACPP_MAX_TOKENS   = LLAMACPP_CONTEXT_SIZE
 
 MAX_TOKENS        = 16384  # Anthropic / Xiaomi / DeepSeek -- 8192 was
 # observed truncating real functions mid-statement (Rook::Move,
