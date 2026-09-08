@@ -76,8 +76,8 @@ def compute_confidence(source_type: str, evidence: Optional[list] = None) -> flo
     never distinct passes or repeated restatements: the translator already
     threads `current_code` pass-to-pass, so the same model repeating its
     own earlier conclusion across passes is not independent evidence — and
-    counting occurrences instead of distinct categories would also let
-    Bonsai's documented repetition-loop failure mode inflate confidence for
+    counting occurrences instead of distinct categories would also let a
+    local model's repetition-loop failure mode inflate confidence for
     free. `source_type` defaults to the lower ("ai") weight for anything
     unrecognized, so a typo'd source_type fails safe rather than fails open.
     """
@@ -108,6 +108,7 @@ class SemanticDB:
         "provider":     "TEXT    DEFAULT ''",  # which LLM provider produced the current results
         "summary":      "TEXT    DEFAULT ''",  # one-line AI-generated description
         "final_cpp":    "TEXT    DEFAULT ''",  # the single translation pass's accepted output
+        "review_status": "TEXT  DEFAULT ''",  # ''=not yet reviewed, 'passed', 'unresolved', or 'skipped' (MAX_REVIEW_ROUNDS=0) -- see ai/translator.py's review loop
         "analyzed_at":  "TEXT    DEFAULT (datetime('now'))",
     }
 
@@ -383,18 +384,25 @@ class SemanticDB:
 
     def clear_result(self, binary: str, address: str):
         """
-        Wipe final_cpp, ai_name, and summary for a function. Used when
-        switching providers, so a stale result from a different provider
-        can never be left dangling under the new provider's marker —
+        Wipe final_cpp, ai_name, summary, and review_status for a function.
+        Used when switching providers, so a stale result from a different
+        provider can never be left dangling under the new provider's marker —
         otherwise an interruption right after the switch (before the new
         provider has produced anything) would let old data masquerade as
         "complete" under the new provider on a later resumed run.
         """
         with self._conn() as conn:
             conn.execute("""
-                UPDATE functions SET final_cpp = '', ai_name = '', summary = ''
+                UPDATE functions SET final_cpp = '', ai_name = '', summary = '', review_status = ''
                 WHERE binary = ? AND address = ?
             """, (binary, address))
+
+    def set_review_status(self, binary: str, address: str, status: str):
+        """status: '' (not yet reviewed), 'passed', 'unresolved', or 'skipped' (see ai/translator.py)."""
+        with self._conn() as conn:
+            conn.execute("""
+                UPDATE functions SET review_status = ? WHERE binary = ? AND address = ?
+            """, (status, binary, address))
 
     def is_complete_for_provider(self, binary: str, address: str, provider: str) -> bool:
         """
@@ -536,8 +544,9 @@ class SemanticDB:
     # `__do_global_ctors`, at different addresses) still can't be told
     # apart. Fixing that would mean capturing callee addresses in
     # ghidra_scripts/ExportAnalysis.java's export and threading that through
-    # parse_output.py and the callee-guard logic in ai/translator.py too —
-    # a materially bigger change than this fix, left for a future pass.
+    # parse_output.py and get_callee_summaries()'s own callers in
+    # ai/translator.py too — a materially bigger change than this fix,
+    # left for a future pass.
 
     def add_call_edge(self, binary: str, caller_addr: str, callee_name: str):
         with self._conn() as conn:

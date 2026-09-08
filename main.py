@@ -43,7 +43,7 @@ from rich.progress import (
 
 from config import (
     DB_PATH, GHIDRA_JSON_DIR, OUTPUT_DIR, LLM_PROVIDER, OLLAMA_MODEL,
-    OUTPUT_WRITE_EVERY_N_FUNCTIONS, OUTPUT_WRITE_EVERY_SECONDS,
+    OUTPUT_WRITE_EVERY_N_FUNCTIONS, OUTPUT_WRITE_EVERY_SECONDS, MAX_REVIEW_ROUNDS,
 )
 from analyzer.ghidra_runner import analyze_binary
 from analyzer.parse_output import load_analysis
@@ -51,7 +51,7 @@ from analyzer.ir_builder import build_ir
 from analyzer.cfg_builder import build_cfg_summary, analyze_deterministic
 from analyzer.types_db import SemanticDB, compute_confidence
 from analyzer.known_apis import KNOWN_APIS
-from analyzer.library_signatures import detect_library_types, classify_known_apis
+from analyzer.library_signatures import detect_library_types, classify_known_apis, translation_exclusion_reason
 from ai.translator import FunctionTranslator, extract_function_name
 from output.writer import ProjectWriter
 
@@ -110,7 +110,7 @@ def main():
         help="Process only the first N functions (0 = all)"
     )
     parser.add_argument(
-        "--provider", default=LLM_PROVIDER, choices=["anthropic", "xiaomi", "ollama", "bonsai", "deepseek"],
+        "--provider", default=LLM_PROVIDER, choices=["anthropic", "xiaomi", "ollama", "llamacpp", "deepseek"],
         help=f"LLM provider (default: {LLM_PROVIDER})"
     )
     parser.add_argument(
@@ -312,6 +312,19 @@ def main():
         task = progress.add_task("Reconstructing...", total=len(functions))
 
         for fn in functions:
+            # Library/runtime code (real STL/libstdc++ internals, Ghidra's
+            # own unresolved-self-call artifacts, and MinGW CRT-startup
+            # plumbing) is out of scope for translation entirely — skip it
+            # (and the review loop) rather than spend an LLM round trip on
+            # it. See analyzer/library_signatures.py's
+            # translation_exclusion_reason().
+            exclusion_reason = translation_exclusion_reason(fn)
+            if exclusion_reason:
+                progress.update(task, description=f"[dim]{fn.name[:30]} (excluded)[/dim]")
+                writer.add_excluded(fn.name, fn.address, exclusion_reason, fn.signature)
+                progress.advance(task)
+                continue
+
             # Resume support: a prior run may have already fully translated
             # this function with this exact provider — reuse it instead of
             # another LLM round trip. A result from a *different* provider
@@ -322,6 +335,11 @@ def main():
                 cached = db.get_function(binary_name, fn.address)
                 ai_name = cached.get("ai_name") or fn.name
                 writer.add_function(ai_name, fn.address, cached["final_cpp"], fn.signature)
+                if cached.get("review_status") == "unresolved":
+                    console.print(
+                        f"  [yellow]![/yellow] {fn.name}: cached result never reached a "
+                        f"review pass — shipped anyway"
+                    )
                 _write_if_due()
                 progress.advance(task)
                 continue
@@ -341,6 +359,13 @@ def main():
 
             ai_name = extract_function_name(cpp, fn.name)
             writer.add_function(ai_name, fn.address, cpp, fn.signature)
+
+            if db.get_function(binary_name, fn.address).get("review_status") == "unresolved":
+                console.print(
+                    f"  [yellow]![/yellow] {fn.name}: review didn't reach a pass "
+                    f"after {MAX_REVIEW_ROUNDS} round(s) — shipped anyway"
+                )
+
             _write_if_due()
             progress.advance(task)
 

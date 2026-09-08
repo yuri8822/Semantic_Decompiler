@@ -34,8 +34,9 @@ output/recovered/
 # The .gpr and .rep are local workspace state, not source
 ghidra_project/
 
-# ── Vendored inference engines ──────────────────────────────────────────────
-# PrismML's llama.cpp fork (Bonsai 1-bit support) — built locally, not source
+# ── Local inference engine / weights ────────────────────────────────────────
+# llama.cpp is expected as a system install, not vendored here — but keep this
+# ignore so a local clone dropped in the tree never gets committed by accident
 llama.cpp/
 
 # Model weights (large, downloaded separately)

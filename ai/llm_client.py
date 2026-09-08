@@ -1,6 +1,6 @@
 """
 Unified LLM client — thin facade over the per-model implementations in
-ai/providers/. Each provider (Anthropic, Xiaomi, Ollama, Bonsai) lives in
+ai/providers/. Each provider (Anthropic, Xiaomi, Ollama, llama.cpp, DeepSeek) lives in
 its own file so it can be tuned independently; this class just picks one
 and forwards complete() calls to it.
 

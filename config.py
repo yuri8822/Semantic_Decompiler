@@ -17,7 +17,7 @@ OUTPUT_DIR = PROJECT_ROOT / "output" / "recovered"
 DB_PATH = str(PROJECT_ROOT / "semantic.db")
 
 # --- AI provider ---
-# Set LLM_PROVIDER to "anthropic", "xiaomi", "ollama", "bonsai", or "deepseek"
+# Set LLM_PROVIDER to "anthropic", "xiaomi", "ollama", "llamacpp", or "deepseek"
 LLM_PROVIDER = "anthropic"
 
 # Anthropic (cloud)
@@ -37,16 +37,13 @@ DEEPSEEK_MODEL    = "deepseek-v4-pro"
 OLLAMA_BASE_URL = "http://localhost:11434/v1"
 OLLAMA_MODEL    = "carstenuhlig/omnicoder-9b:q4_k_m"
 
-# Bonsai 27B (1-bit, local) — llama.cpp server via PrismML's fork, vendored at
-# ai/providers/bonsai/llama.cpp/ (gitignored; prebuilt Windows CUDA binaries
-# live under llama.cpp/bin/extracted/, no build required)
-# Weights: ai/providers/bonsai/model/Bonsai-27B-Q1_0.gguf (gitignored, *.gguf)
-# from https://huggingface.co/prism-ml/Bonsai-27B-gguf
-# Start the server first, from ai/providers/bonsai/llama.cpp/bin/extracted/:
-#   ./llama-server.exe -m ../../../model/Bonsai-27B-Q1_0.gguf --host 0.0.0.0 --port 8080 -ngl 99
-BONSAI_BASE_URL   = "http://localhost:8080/v1"
-BONSAI_MODEL      = "Bonsai-27B-Q1_0"  # sent in the request; llama-server ignores it and serves whatever's loaded
-BONSAI_MAX_TOKENS = 4096
+# llama.cpp (local) — llama-server's OpenAI-compatible endpoint on port 8080.
+# Model-agnostic: start llama-server (a system install, not vendored here)
+# with whatever GGUF you want — see start_llamacpp.bat — and the provider
+# talks to it as-is.
+LLAMACPP_BASE_URL   = "http://localhost:8080/v1"
+LLAMACPP_MODEL      = "local"  # sent in the request; llama-server ignores it and serves whatever's loaded
+LLAMACPP_MAX_TOKENS = 4096
 
 MAX_TOKENS        = 16384  # Anthropic / Xiaomi / DeepSeek -- 8192 was
 # observed truncating real functions mid-statement (Rook::Move,
@@ -66,3 +63,15 @@ DECOMPILER_TIMEOUT_SECONDS = 60
 # always unconditional, so nothing is ever missing from disk at the end.
 OUTPUT_WRITE_EVERY_N_FUNCTIONS = 5
 OUTPUT_WRITE_EVERY_SECONDS = 30
+
+# --- Reviewer loop ---
+# After the refactor agent produces a version, a separate reviewer agent
+# checks it against the original Ghidra decompiled code (ground truth) and
+# either passes it or returns specific issues, which get fed back into
+# another refactor attempt. Bounded so a stubborn disagreement can't loop
+# forever -- MAX_REVIEW_ROUNDS is the number of review checks performed; if
+# the last one still fails, whatever the last attempt produced ships anyway,
+# flagged 'unresolved' in the DB rather than blocking the run over one function.
+# Set to 0 to disable the review loop entirely -- no reviewer call at all,
+# the refactor agent's own output ships as-is (flagged 'skipped' in the DB).
+MAX_REVIEW_ROUNDS = 3

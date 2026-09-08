@@ -1,17 +1,18 @@
 """
-Single-pass AI translator. One rich, evidence-loaded prompt per function —
-no multi-pass loop, no validation/retry, no name-lock. The context that
-used to be spread across 6 passes (deterministic evidence, library hints,
-whole-program context, callee/caller summaries, known-API signatures,
-p-code IR, CFG summary) is gathered once and handed to a single call.
+Single-pass AI translator, plus a second reviewer agent that checks the
+first agent's own output against the original Ghidra decompiled code. The
+context that used to be spread across 6 passes (deterministic evidence,
+library hints, whole-program context, callee/caller summaries, known-API
+signatures, p-code IR, CFG summary) is gathered once and reused for both
+agents; see build_review_prompt()/REVIEWER_SYSTEM_PROMPT in ai/prompts.py.
 """
 
 import json
 import re
 
-from config import OLLAMA_MODEL, LLM_PROVIDER
+from config import OLLAMA_MODEL, LLM_PROVIDER, MAX_REVIEW_ROUNDS
 from ai.llm_client import LLMClient
-from ai.prompts import SYSTEM_PROMPT, build_user_prompt
+from ai.prompts import SYSTEM_PROMPT, build_user_prompt, REVIEWER_SYSTEM_PROMPT, build_review_prompt
 from analyzer.types_db import SemanticDB
 
 
@@ -20,10 +21,35 @@ def _call_llm(client: LLMClient, system: str, user: str, pass_num: int) -> str:
 
 
 def _strip_fences(text: str) -> str:
-    """Remove markdown code fences the model might add despite instructions."""
-    text = re.sub(r"^```[a-zA-Z]*\n?", "", text, flags=re.MULTILINE)
-    text = re.sub(r"^```$", "", text, flags=re.MULTILINE)
+    """
+    Remove markdown code fences the model might add despite instructions.
+    Tolerates incidental leading/trailing whitespace around the fence line
+    itself (e.g. " ```", a single space before the backticks) -- anchoring
+    directly to "^```" with no slack there let a real, observed case slip
+    through unstripped and land verbatim in the output.
+    """
+    text = re.sub(r"^[ \t]*```[a-zA-Z]*[ \t]*\n?", "", text, flags=re.MULTILINE)
+    text = re.sub(r"^[ \t]*```[ \t]*$", "", text, flags=re.MULTILINE)
     return text.strip()
+
+
+_VERDICT_RE = re.compile(r"VERDICT:\s*(PASS|FAIL)\b", re.IGNORECASE)
+
+
+def _parse_verdict(text: str) -> tuple[str, str]:
+    """
+    (verdict, issues) from the reviewer's response. Matched via an explicit
+    "VERDICT: PASS|FAIL" line rather than scanning the prose for a bare
+    word like "approved" -- free text can say something like "I'd approve
+    this if X were fixed" without meaning to pass it, so only the fixed-
+    format line is trusted as the actual signal. If the reviewer doesn't
+    produce that line at all, the response is treated as FAIL (the raw
+    text becomes the "issues") rather than assumed to be a pass.
+    """
+    m = _VERDICT_RE.search(text)
+    if not m:
+        return "FAIL", text.strip()
+    return m.group(1).upper(), text[m.end():].strip()
 
 
 _NAME_SKIP = frozenset({
@@ -262,7 +288,14 @@ class FunctionTranslator:
         # up, so it always gets the strongest available tier.
         final_code = _call_llm(self._llm, SYSTEM_PROMPT, user, pass_num=4)
 
+        final_code, review_status = self._review_loop(
+            function_data, final_code, api_context, deterministic_evidence,
+            library_hints, whole_program_context, recovered_types,
+            callee_summaries, caller_summaries, ir, cfg_summary,
+        )
+
         self.db.set_final_cpp(self.binary_name, address, final_code)
+        self.db.set_review_status(self.binary_name, address, review_status)
 
         ai_name = extract_function_name(final_code, fallback="")
         if ai_name and ai_name != name:
@@ -279,6 +312,63 @@ class FunctionTranslator:
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
+
+    def _review_loop(self, function_data, code, api_context, deterministic_evidence,
+                      library_hints, whole_program_context, recovered_types,
+                      callee_summaries, caller_summaries, ir, cfg_summary) -> tuple:
+        """
+        Second-agent review: a separate reviewer prompt (REVIEWER_SYSTEM_PROMPT)
+        checks `code` against function_data['decompiled'] — the original
+        Ghidra output, ground truth for logic/structure — and either passes
+        it or returns concrete issues, which get fed back into another
+        refactor attempt via build_user_prompt's previous_attempt/
+        review_feedback. Bounded by MAX_REVIEW_ROUNDS so a stubborn
+        disagreement can't loop forever: whatever the last attempt produced
+        ships either way, the returned status just says whether the
+        reviewer actually agreed to it.
+
+        MAX_REVIEW_ROUNDS = 0 disables the review loop entirely -- `code`
+        ships as-is with no reviewer call at all, not even one.
+        """
+        if MAX_REVIEW_ROUNDS <= 0:
+            return code, "skipped"
+
+        for round_num in range(MAX_REVIEW_ROUNDS):
+            review_text = self._llm.complete(
+                REVIEWER_SYSTEM_PROMPT,
+                build_review_prompt(
+                    function_data=function_data,
+                    refactored_code=code,
+                    api_context=api_context,
+                    deterministic_evidence=deterministic_evidence,
+                    library_hints=library_hints,
+                    recovered_types=recovered_types,
+                    callee_summaries=callee_summaries,
+                    caller_summaries=caller_summaries,
+                ),
+                pass_num=4,
+            )
+            verdict, issues = _parse_verdict(review_text)
+            if verdict == "PASS":
+                return code, "passed"
+            if round_num == MAX_REVIEW_ROUNDS - 1:
+                return code, "unresolved"
+
+            user = build_user_prompt(
+                function_data=function_data,
+                ir=ir,
+                cfg_summary=cfg_summary,
+                api_context=api_context,
+                deterministic_evidence=deterministic_evidence,
+                library_hints=library_hints,
+                whole_program_context=whole_program_context,
+                recovered_types=recovered_types,
+                callee_summaries=callee_summaries,
+                caller_summaries=caller_summaries,
+                previous_attempt=code,
+                review_feedback=issues,
+            )
+            code = _call_llm(self._llm, SYSTEM_PROMPT, user, pass_num=4)
 
     def _harvest_types(self, code: str, source_addr: str):
         """

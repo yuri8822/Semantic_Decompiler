@@ -6,14 +6,14 @@ tuned independently without touching the others.
 from ai.providers.anthropic.anthropic_provider import AnthropicProvider
 from ai.providers.xiaomi.xiaomi_provider import XiaomiProvider
 from ai.providers.ollama.ollama_provider import OllamaProvider
-from ai.providers.bonsai.bonsai_provider import BonsaiProvider
+from ai.providers.llamacpp.llamacpp_provider import LlamaCppProvider
 from ai.providers.deepseek.deepseek_provider import DeepSeekProvider
 
 _REGISTRY = {
     "anthropic": AnthropicProvider,
     "xiaomi": XiaomiProvider,
     "ollama": OllamaProvider,
-    "bonsai": BonsaiProvider,
+    "llamacpp": LlamaCppProvider,
     "deepseek": DeepSeekProvider,
 }
 

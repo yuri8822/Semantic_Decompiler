@@ -30,8 +30,8 @@ A SQLite knowledge graph persists all of this across functions and across runs �
   - [Anthropic](https://console.anthropic.com) — API key required
   - [Xiaomi MiMo](https://platform.xiaomimomo.com) — API key required
   - [Ollama](https://ollama.com) — local, no key needed
-  - [Bonsai 27B (1-bit)](https://huggingface.co/prism-ml/Bonsai-27B-gguf) — local, no key needed, but requires
-    building [PrismML's llama.cpp fork](https://github.com/PrismML-Eng/llama.cpp) and running it as a server
+  - [llama.cpp](https://github.com/ggml-org/llama.cpp) — local, no key needed; run `llama-server` on port 8080
+    with any GGUF and point the pipeline at it
 
 ---
 
@@ -66,7 +66,7 @@ Edit [`config.py`](config.py) for your environment:
 # Path to Ghidra's headless analyzer
 GHIDRA_PATH = r"C:\path\to\ghidra\support\analyzeHeadless.bat"
 
-# Default provider: "anthropic", "xiaomi", "ollama", or "bonsai"
+# Default provider: "anthropic", "xiaomi", "ollama", "llamacpp", or "deepseek"
 LLM_PROVIDER = "anthropic"
 
 # Anthropic models (heavy for the reconstruction pass, fast for the one-line summary)
@@ -79,9 +79,8 @@ XIAOMI_MODEL = "mimo-v2.5-pro"
 # Ollama (local)
 OLLAMA_MODEL = "carstenuhlig/omnicoder-9b:q4_k_m"
 
-# Bonsai 27B, 1-bit (local, via a llama.cpp server)
-BONSAI_BASE_URL = "http://localhost:8080/v1"
-BONSAI_MODEL    = "Bonsai-27B-Q1_0"
+# llama.cpp (local) — whatever GGUF llama-server currently has loaded
+LLAMACPP_BASE_URL = "http://localhost:8080/v1"
 ```
 
 ---
@@ -96,7 +95,7 @@ python main.py <binary> [options]
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--provider` | `anthropic` | LLM provider: `anthropic`, `xiaomi`, `ollama`, `bonsai` |
+| `--provider` | `anthropic` | LLM provider: `anthropic`, `xiaomi`, `ollama`, `llamacpp`, `deepseek` |
 | `--limit` | `0` (all) | Process only the first N functions |
 | `--output` | `output/recovered` | Output directory |
 | `--skip-ghidra` | — | Reuse existing Ghidra JSON export (now automatic if one exists — kept for explicitness) |
@@ -116,8 +115,8 @@ python main.py target.exe --provider xiaomi --limit 10
 # Local run with Ollama, reusing a prior Ghidra export
 python main.py target.exe --provider ollama --skip-ghidra
 
-# Local run with the Bonsai 27B (1-bit) llama.cpp server
-python main.py target.exe --provider bonsai --skip-ghidra
+# Local run against a llama.cpp server on port 8080
+python main.py target.exe --provider llamacpp --skip-ghidra
 
 # Analyze a Windows system binary
 python main.py "C:\Windows\System32\find.exe" --provider xiaomi --limit 5
@@ -163,30 +162,23 @@ ollama pull qwen2.5-coder:7b
 python main.py target.exe --provider ollama
 ```
 
-### Bonsai 27B, 1-bit (local)
-Free, fully offline, ~5 GB VRAM for a 27B model — every weight is 1 bit. Needs
-[PrismML's llama.cpp fork](https://github.com/PrismML-Eng/llama.cpp) (vanilla
-llama.cpp doesn't have the required `Q1_0_g128` kernels) and the
-[`Bonsai-27B-gguf`](https://huggingface.co/prism-ml/Bonsai-27B-gguf) weights
-(the true 1-bit repo — not `Ternary-Bonsai-27B-gguf`).
+### llama.cpp (local)
+Free, fully offline, model-agnostic. Serve any GGUF with `llama-server` on port
+8080 and the pipeline talks to its OpenAI-compatible endpoint — no
+model-specific request options are sent, so whatever's loaded is what runs.
 
-The fork is vendored at `ai/providers/bonsai/llama.cpp/` (gitignored — it's a
-built local dependency, not project source). Prebuilt Windows CUDA binaries
-are enough; no compiler/MSVC needed.
+Neither the engine nor any weights live in this repo: install llama.cpp
+system-wide (prebuilt releases are enough — no compiler/MSVC needed) and make
+sure `llama-server` resolves on `PATH`.
 
 ```bash
-# one-time setup, from ai/providers/bonsai/:
-git clone https://github.com/PrismML-Eng/llama.cpp
-# grab the Windows CUDA release asset + cudart runtime from the fork's GitHub
-# releases page and extract both into llama.cpp/bin/extracted/
-# then download Bonsai-27B-Q1_0.gguf into ai/providers/bonsai/model/
-# (both llama.cpp/ and *.gguf are gitignored)
+# start the server with whatever GGUF you want
+llama-server --model /path/to/model.gguf --host 0.0.0.0 --port 8080 -ngl 99
 
-cd llama.cpp/bin/extracted
-./llama-server.exe -m ../../../model/Bonsai-27B-Q1_0.gguf --host 0.0.0.0 --port 8080 -ngl 99
+# on Windows, set MODEL in start_llamacpp.bat and run that instead
 
 # in another terminal
-python main.py target.exe --provider bonsai
+python main.py target.exe --provider llamacpp
 ```
 
 ---
@@ -215,8 +207,8 @@ ai/
     anthropic/anthropic_provider.py — Claude, heavy/fast model split (reconstruction vs. summary)
     xiaomi/xiaomi_provider.py       — MiMo, Anthropic-compatible API
     ollama/ollama_provider.py       — Local, OpenAI-compatible endpoint
-    bonsai/bonsai_provider.py       — Local Bonsai 27B (1-bit), OpenAI-compatible endpoint
-    bonsai/llama.cpp/               — Vendored PrismML fork (gitignored) + prebuilt binaries
+    llamacpp/llamacpp_provider.py   — Local llama-server on port 8080, OpenAI-compatible endpoint
+    deepseek/deepseek_provider.py   — DeepSeek, OpenAI-compatible API
 
 output/
   writer.py                 — Writes recovered.h, recovered.cpp, function_index.txt
